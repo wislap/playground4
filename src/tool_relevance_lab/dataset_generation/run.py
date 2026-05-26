@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import json
 import os
+from collections.abc import Sequence
 from pathlib import Path
 
 from tool_relevance_lab.dataset_generation.neko_importer import (
@@ -16,7 +17,16 @@ from tool_relevance_lab.dataset_generation.classification import (
     validate_classification_coverage,
 )
 from tool_relevance_lab.dataset_generation.calibration import calibrate_confidences
+from tool_relevance_lab.dataset_generation.conversation_generation import (
+    ConversationGenerationConfig,
+    generate_conversations,
+)
+from tool_relevance_lab.dataset_generation.candidate_generation import (
+    CandidateGenerationConfig,
+    generate_candidate_sets,
+)
 from tool_relevance_lab.dataset_generation.jsonl import read_model_jsonl, write_jsonl
+from tool_relevance_lab.dataset_generation.judging import JudgeGenerationConfig, judge_candidate_sets
 from tool_relevance_lab.dataset_generation.llm import OpenAICompatibleConfig, OpenAICompatibleLLMClient
 from tool_relevance_lab.dataset_generation.quality import summarize_quality
 from tool_relevance_lab.dataset_generation.schemas import (
@@ -24,6 +34,7 @@ from tool_relevance_lab.dataset_generation.schemas import (
     JudgmentRecord,
 )
 from tool_relevance_lab.dataset_generation.similarity import find_similar_tools, summarize_similarity
+from tool_relevance_lab.dataset_generation.resumable import run_resumable_jobs, write_run_summary
 from tool_relevance_lab.dataset_generation.synthetic_plugins import (
     SyntheticPluginGenerationConfig,
     generate_synthetic_plugin_universe,
@@ -106,6 +117,65 @@ def main() -> None:
     merge_parser.add_argument("--output", type=Path, required=True)
     merge_parser.add_argument("--tool-universe-id", required=True)
     merge_parser.add_argument("inputs", type=Path, nargs="+")
+
+    smoke_parser = subparsers.add_parser("smoke-resumable-run")
+    smoke_parser.add_argument("--output", type=Path, required=True)
+    smoke_parser.add_argument("--errors", type=Path, required=True)
+    smoke_parser.add_argument("--summary", type=Path)
+    smoke_parser.add_argument("--count", type=int, default=20)
+    smoke_parser.add_argument("--concurrency", type=int, default=4)
+    smoke_parser.add_argument("--fail-every", type=int, default=0)
+
+    conversation_parser = subparsers.add_parser("generate-conversations")
+    conversation_parser.add_argument("--tool-universe", type=Path, action="append", required=True)
+    conversation_parser.add_argument("--tool-universe-id")
+    conversation_parser.add_argument("--output", type=Path, required=True)
+    conversation_parser.add_argument("--errors", type=Path, required=True)
+    conversation_parser.add_argument("--summary", type=Path)
+    conversation_parser.add_argument("--count", type=int, default=100)
+    conversation_parser.add_argument("--targets-per-conversation", type=int, default=1)
+    conversation_parser.add_argument("--seed", type=int, default=20260526)
+    conversation_parser.add_argument("--concurrency", type=int, default=4)
+    conversation_parser.add_argument("--max-attempts", type=int, default=3)
+    conversation_parser.add_argument("--model", default=os.getenv("CONV_GEN_MODEL", "generator-model"))
+    conversation_parser.add_argument("--base-url", default=os.getenv("CONV_GEN_BASE_URL", ""))
+    conversation_parser.add_argument("--api-key", default=os.getenv("CONV_GEN_API_KEY", ""))
+    conversation_parser.add_argument("--temperature", type=float, default=0.9)
+    conversation_parser.add_argument("--timeout-seconds", type=float, default=120.0)
+    conversation_parser.add_argument("--retries", type=int, default=3)
+    conversation_parser.add_argument("--dry-run", action="store_true")
+
+    candidate_parser = subparsers.add_parser("sample-candidates")
+    candidate_parser.add_argument("--tool-universe", type=Path, action="append", required=True)
+    candidate_parser.add_argument("--tool-universe-id")
+    candidate_parser.add_argument("--conversations", type=Path, required=True)
+    candidate_parser.add_argument("--output", type=Path, required=True)
+    candidate_parser.add_argument("--errors", type=Path, required=True)
+    candidate_parser.add_argument("--summary", type=Path)
+    candidate_parser.add_argument("--plugin-sample-rate", type=float, default=0.10)
+    candidate_parser.add_argument("--target-force-rate", type=float, default=1.0)
+    candidate_parser.add_argument("--weight-decay-on-select", type=float, default=0.70)
+    candidate_parser.add_argument("--seed", type=int, default=20260526)
+    candidate_parser.add_argument("--concurrency", type=int, default=1)
+
+    judge_parser = subparsers.add_parser("judge-candidates")
+    judge_parser.add_argument("--tool-universe", type=Path, action="append", required=True)
+    judge_parser.add_argument("--tool-universe-id")
+    judge_parser.add_argument("--conversations", type=Path, required=True)
+    judge_parser.add_argument("--candidate-sets", type=Path, required=True)
+    judge_parser.add_argument("--output", type=Path, required=True)
+    judge_parser.add_argument("--errors", type=Path, required=True)
+    judge_parser.add_argument("--summary", type=Path)
+    judge_parser.add_argument("--judge-run-id", default="judge_v1")
+    judge_parser.add_argument("--model", default=os.getenv("JUDGE_MODEL", "judge-model"))
+    judge_parser.add_argument("--base-url", default=os.getenv("JUDGE_BASE_URL", ""))
+    judge_parser.add_argument("--api-key", default=os.getenv("JUDGE_API_KEY", ""))
+    judge_parser.add_argument("--temperature", type=float, default=0.2)
+    judge_parser.add_argument("--concurrency", type=int, default=4)
+    judge_parser.add_argument("--max-attempts", type=int, default=3)
+    judge_parser.add_argument("--timeout-seconds", type=float, default=120.0)
+    judge_parser.add_argument("--retries", type=int, default=3)
+    judge_parser.add_argument("--dry-run", action="store_true")
 
     args = parser.parse_args()
     if args.command == "calibrate":
@@ -261,6 +331,147 @@ def main() -> None:
         )
         print(f"wrote {len(merged.tools)} tools to {args.output}")
         return
+
+    if args.command == "smoke-resumable-run":
+        summary = asyncio.run(
+            _run_smoke_resumable(
+                output_path=args.output,
+                error_path=args.errors,
+                count=args.count,
+                concurrency=args.concurrency,
+                fail_every=args.fail_every,
+            )
+        )
+        if args.summary:
+            write_run_summary(args.summary, summary)
+        print(json.dumps(summary.to_dict(), ensure_ascii=False, indent=2, sort_keys=True))
+        return
+
+    if args.command == "generate-conversations":
+        universe = load_tool_universes(args.tool_universe, tool_universe_id=args.tool_universe_id)
+        client = None
+        if not args.dry_run:
+            if not args.api_key or not args.base_url:
+                raise SystemExit("CONV_GEN_API_KEY/CONV_GEN_BASE_URL or --api-key/--base-url are required")
+            client = OpenAICompatibleLLMClient(
+                OpenAICompatibleConfig(
+                    api_key=args.api_key,
+                    base_url=args.base_url,
+                    model=args.model,
+                    timeout_seconds=args.timeout_seconds,
+                    max_retries=args.retries,
+                )
+            )
+        summary = asyncio.run(
+            generate_conversations(
+                universe=universe,
+                client=client,
+                output_path=args.output,
+                error_path=args.errors,
+                config=ConversationGenerationConfig(
+                    count=args.count,
+                    targets_per_conversation=args.targets_per_conversation,
+                    seed=args.seed,
+                    model=args.model,
+                    temperature=args.temperature,
+                    concurrency=args.concurrency,
+                    max_attempts=args.max_attempts,
+                ),
+                dry_run=args.dry_run,
+            )
+        )
+        if args.summary:
+            write_run_summary(args.summary, summary)
+        print(json.dumps(summary.to_dict(), ensure_ascii=False, indent=2, sort_keys=True))
+        return
+
+    if args.command == "sample-candidates":
+        universe = load_tool_universes(args.tool_universe, tool_universe_id=args.tool_universe_id)
+        summary = asyncio.run(
+            generate_candidate_sets(
+                universe=universe,
+                conversations_path=args.conversations,
+                output_path=args.output,
+                error_path=args.errors,
+                config=CandidateGenerationConfig(
+                    plugin_sample_rate=args.plugin_sample_rate,
+                    target_force_rate=args.target_force_rate,
+                    weight_decay_on_select=args.weight_decay_on_select,
+                    seed=args.seed,
+                    concurrency=args.concurrency,
+                ),
+            )
+        )
+        if args.summary:
+            write_run_summary(args.summary, summary)
+        print(json.dumps(summary.to_dict(), ensure_ascii=False, indent=2, sort_keys=True))
+        return
+
+    if args.command == "judge-candidates":
+        universe = load_tool_universes(args.tool_universe, tool_universe_id=args.tool_universe_id)
+        client = None
+        if not args.dry_run:
+            if not args.api_key or not args.base_url:
+                raise SystemExit("JUDGE_API_KEY/JUDGE_BASE_URL or --api-key/--base-url are required")
+            client = OpenAICompatibleLLMClient(
+                OpenAICompatibleConfig(
+                    api_key=args.api_key,
+                    base_url=args.base_url,
+                    model=args.model,
+                    timeout_seconds=args.timeout_seconds,
+                    max_retries=args.retries,
+                )
+            )
+        summary = asyncio.run(
+            judge_candidate_sets(
+                universe=universe,
+                client=client,
+                conversations_path=args.conversations,
+                candidate_sets_path=args.candidate_sets,
+                output_path=args.output,
+                error_path=args.errors,
+                config=JudgeGenerationConfig(
+                    model=args.model,
+                    temperature=args.temperature,
+                    concurrency=args.concurrency,
+                    max_attempts=args.max_attempts,
+                    judge_run_id=args.judge_run_id,
+                ),
+                dry_run=args.dry_run,
+            )
+        )
+        if args.summary:
+            write_run_summary(args.summary, summary)
+        print(json.dumps(summary.to_dict(), ensure_ascii=False, indent=2, sort_keys=True))
+        return
+
+
+async def _run_smoke_resumable(
+    *,
+    output_path: Path,
+    error_path: Path,
+    count: int,
+    concurrency: int,
+    fail_every: int,
+):
+    items: Sequence[str] = [f"sample_{index:04d}" for index in range(1, count + 1)]
+
+    async def worker(item: str) -> dict:
+        index = int(item.rsplit("_", 1)[1])
+        if fail_every > 0 and index % fail_every == 0:
+            raise RuntimeError(f"intentional smoke failure for {item}")
+        return {"sample_id": item, "ok": True}
+
+    return await run_resumable_jobs(
+        items=items,
+        item_id=lambda item: item,
+        completed_id=lambda row: row.get("sample_id"),
+        output_path=output_path,
+        error_path=error_path,
+        worker=worker,
+        concurrency=concurrency,
+        progress_label="smoke",
+    )
 
 
 if __name__ == "__main__":

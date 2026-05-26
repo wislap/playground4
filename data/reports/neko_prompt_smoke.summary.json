@@ -1,0 +1,10 @@
+{
+  "completed_existing": 0,
+  "error_path": "data/conversations/neko_prompt_smoke.errors.jsonl",
+  "failed": 0,
+  "output_path": "data/conversations/neko_prompt_smoke.jsonl",
+  "skipped": 0,
+  "submitted": 5,
+  "succeeded": 5,
+  "total": 5
+}

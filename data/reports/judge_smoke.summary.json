@@ -1,0 +1,10 @@
+{
+  "completed_existing": 0,
+  "error_path": "data/judgments/generated_smoke.errors.jsonl",
+  "failed": 0,
+  "output_path": "data/judgments/generated_smoke.jsonl",
+  "skipped": 0,
+  "submitted": 3,
+  "succeeded": 3,
+  "total": 3
+}
