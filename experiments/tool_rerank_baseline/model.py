@@ -370,12 +370,45 @@ class LateInteractionRegressor(nn.Module):
         *,
         hidden_size: int,
         lexical_dim: int = 0,
+        lexical_fusion: str = "concat",
+        lexical_dropout: float = 0.0,
         hidden_dim: int = 256,
         dropout: float = 0.1,
     ) -> None:
         super().__init__()
+        semantic_dim = hidden_size * 4 + 6
+        self.lexical_fusion = lexical_fusion
+        self.lexical_dropout = nn.Dropout(lexical_dropout)
+        if lexical_dim > 0 and lexical_fusion == "gated_add":
+            self.lexical_projection = nn.Linear(lexical_dim, semantic_dim)
+            self.lexical_gate = nn.Sequential(
+                nn.Linear(semantic_dim + lexical_dim, max(16, hidden_dim // 2)),
+                nn.GELU(),
+                nn.Linear(max(16, hidden_dim // 2), 1),
+                nn.Sigmoid(),
+            )
+            head_input_dim = semantic_dim
+        elif lexical_dim > 0 and lexical_fusion == "gated_concat":
+            self.lexical_projection = None
+            self.lexical_gate = nn.Sequential(
+                nn.Linear(semantic_dim + lexical_dim, max(16, hidden_dim // 2)),
+                nn.GELU(),
+                nn.Linear(max(16, hidden_dim // 2), lexical_dim),
+                nn.Sigmoid(),
+            )
+            head_input_dim = semantic_dim + lexical_dim
+        elif lexical_dim > 0 and lexical_fusion == "concat":
+            self.lexical_projection = None
+            self.lexical_gate = None
+            head_input_dim = semantic_dim + lexical_dim
+        elif lexical_dim == 0:
+            self.lexical_projection = None
+            self.lexical_gate = None
+            head_input_dim = semantic_dim
+        else:
+            raise ValueError(f"unknown lexical_fusion: {lexical_fusion}")
         self.head = nn.Sequential(
-            nn.Linear(hidden_size * 4 + 6 + lexical_dim, hidden_dim),
+            nn.Linear(head_input_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout),
@@ -417,10 +450,25 @@ class LateInteractionRegressor(nn.Module):
             ],
             dim=1,
         )
-        parts = [conv_pool, tool_pool, torch.abs(conv_pool - tool_pool), conv_pool * tool_pool, stats]
+        semantic_features = torch.cat(
+            [conv_pool, tool_pool, torch.abs(conv_pool - tool_pool), conv_pool * tool_pool, stats],
+            dim=1,
+        )
+        features = semantic_features
         if lexical_features is not None:
-            parts.append(lexical_features)
-        features = torch.cat(parts, dim=1)
+            lexical_input = self.lexical_dropout(lexical_features)
+            if self.lexical_fusion == "gated_add":
+                if self.lexical_projection is None or self.lexical_gate is None:
+                    raise RuntimeError("gated lexical fusion is not initialized")
+                gate = self.lexical_gate(torch.cat([semantic_features, lexical_input], dim=1))
+                features = semantic_features + gate * self.lexical_projection(lexical_input)
+            elif self.lexical_fusion == "gated_concat":
+                if self.lexical_gate is None:
+                    raise RuntimeError("gated lexical fusion is not initialized")
+                gate = self.lexical_gate(torch.cat([semantic_features, lexical_input], dim=1))
+                features = torch.cat([semantic_features, gate * lexical_input], dim=1)
+            else:
+                features = torch.cat([semantic_features, lexical_input], dim=1)
         return self.head(features).squeeze(-1)
 
 

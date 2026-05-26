@@ -40,6 +40,21 @@ uv run python experiments/tool_rerank_baseline/train.py \
   --config experiments/tool_rerank_baseline/config_jina_sequence_lexical_v21.toml
 ```
 
+Run gated lexical fusion with lexical feature dropout:
+
+```bash
+uv run python experiments/tool_rerank_baseline/train.py \
+  --config experiments/tool_rerank_baseline/config_jina_sequence_lexical_gated_v22.toml
+```
+
+Run gated lexical concat, which keeps lexical evidence explicit but scales it
+with a learned gate:
+
+```bash
+uv run python experiments/tool_rerank_baseline/train.py \
+  --config experiments/tool_rerank_baseline/config_jina_sequence_lexical_gated_concat_v23.toml
+```
+
 Analyze a finished run:
 
 ```bash

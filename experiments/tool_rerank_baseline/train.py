@@ -83,6 +83,8 @@ def main() -> None:
         model = LateInteractionRegressor(
             hidden_size=train_pairs.conv_sequences.shape[-1],
             lexical_dim=lexical_dim,
+            lexical_fusion=str(config.get("lexical", {}).get("fusion", "concat")),
+            lexical_dropout=float(config.get("lexical", {}).get("dropout", 0.0)),
             hidden_dim=int(config["model"].get("hidden_dim", 256)),
             dropout=float(config["model"].get("dropout", 0.1)),
         ).to(device)
