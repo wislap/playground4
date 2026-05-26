@@ -5,6 +5,7 @@ outputs/
 multirun/
 experiments/**/runs/*
 !experiments/**/runs/.gitkeep
+experiments/**/cache/
 __pycache__/
 *.py[cod]
 dist/

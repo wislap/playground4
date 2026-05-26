@@ -18,7 +18,15 @@ if str(Path(__file__).parent) not in sys.path:
 
 from data import PairExample, load_dataset
 from metrics import append_jsonl, compute_metrics, write_json
-from model import EncodedPairs, PairMLPRegressor, build_encoder, build_pair_features
+from model import (
+    EncodedPairs,
+    EncodedSequencePairs,
+    LateInteractionRegressor,
+    PairMLPRegressor,
+    build_encoder,
+    build_pair_features,
+    build_sequence_encoder,
+)
 
 
 def main() -> None:
@@ -38,33 +46,40 @@ def main() -> None:
         f"train_pairs={len(bundle.train_examples)} val_pairs={len(bundle.val_examples)}"
     )
 
-    encoder = build_encoder(config)
+    device = torch.device(config["train"].get("device", "cpu"))
+    model_kind = config.get("model", {}).get("kind", "pair_mlp")
     fit_texts = sorted(
         {example.conversation_text for example in bundle.train_examples}
         | {example.tool_text for example in bundle.train_examples}
     )
     print(f"[encoder] backend={config['encoder']['backend']} fit_texts={len(fit_texts)}")
-    encoder.fit(fit_texts)
-
-    train_pairs = encode_examples(bundle.train_examples, encoder, config)
-    val_pairs = encode_examples(bundle.val_examples, encoder, config)
-
-    device = torch.device(config["train"].get("device", "cpu"))
-    model = PairMLPRegressor(
-        input_dim=train_pairs.features.shape[1],
-        hidden_dim=int(config["model"].get("hidden_dim", 256)),
-        dropout=float(config["model"].get("dropout", 0.1)),
-    ).to(device)
+    if model_kind == "sequence_late_interaction":
+        encoder = build_sequence_encoder(config)
+        encoder.fit(fit_texts)
+        train_pairs = encode_sequence_examples(bundle.train_examples, encoder, config, split_name="train")
+        val_pairs = encode_sequence_examples(bundle.val_examples, encoder, config, split_name="val")
+        model = LateInteractionRegressor(
+            hidden_size=train_pairs.conv_sequences.shape[-1],
+            hidden_dim=int(config["model"].get("hidden_dim", 256)),
+            dropout=float(config["model"].get("dropout", 0.1)),
+        ).to(device)
+    else:
+        encoder = build_encoder(config)
+        encoder.fit(fit_texts)
+        train_pairs = encode_examples(bundle.train_examples, encoder, config)
+        val_pairs = encode_examples(bundle.val_examples, encoder, config)
+        model = PairMLPRegressor(
+            input_dim=train_pairs.features.shape[1],
+            hidden_dim=int(config["model"].get("hidden_dim", 256)),
+            dropout=float(config["model"].get("dropout", 0.1)),
+        ).to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=float(config["train"].get("lr", 1e-3)),
         weight_decay=float(config["train"].get("weight_decay", 1e-4)),
     )
     train_loader = DataLoader(
-        TensorDataset(
-            torch.from_numpy(train_pairs.features),
-            torch.from_numpy(train_pairs.labels),
-        ),
+        build_tensor_dataset(train_pairs),
         batch_size=int(config["train"].get("batch_size", 256)),
         shuffle=True,
     )
@@ -125,22 +140,71 @@ def encode_examples(examples: list[PairExample], encoder: Any, config: dict[str,
     )
 
 
+def encode_sequence_examples(
+    examples: list[PairExample],
+    encoder: Any,
+    config: dict[str, Any],
+    *,
+    split_name: str,
+) -> EncodedSequencePairs:
+    batch_size = int(config["encoder"].get("batch_size", 8))
+    unique_conversations = sorted({example.conversation_id: example.conversation_text for example in examples}.items())
+    unique_tools = sorted({example.tool_id: example.tool_text for example in examples}.items())
+    conversation_ids = [item[0] for item in unique_conversations]
+    tool_ids = [item[0] for item in unique_tools]
+    conv_seq, conv_mask = encoder.encode_sequence(
+        [item[1] for item in unique_conversations],
+        batch_size=batch_size,
+        cache_key=f"{split_name}_conversations",
+    )
+    tool_seq, tool_mask = encoder.encode_sequence(
+        [item[1] for item in unique_tools],
+        batch_size=batch_size,
+        cache_key=f"{split_name}_tools",
+    )
+    conv_index = {conversation_id: index for index, conversation_id in enumerate(conversation_ids)}
+    tool_index = {tool_id: index for index, tool_id in enumerate(tool_ids)}
+    return EncodedSequencePairs(
+        conv_sequences=np.asarray([conv_seq[conv_index[e.conversation_id]] for e in examples], dtype="float32"),
+        conv_masks=np.asarray([conv_mask[conv_index[e.conversation_id]] for e in examples], dtype="bool"),
+        tool_sequences=np.asarray([tool_seq[tool_index[e.tool_id]] for e in examples], dtype="float32"),
+        tool_masks=np.asarray([tool_mask[tool_index[e.tool_id]] for e in examples], dtype="bool"),
+        labels=np.asarray([example.label for example in examples], dtype="float32"),
+        conversation_ids=[example.conversation_id for example in examples],
+        tool_ids=[example.tool_id for example in examples],
+        raw_scores=np.asarray([example.raw_score for example in examples], dtype="float32"),
+    )
+
+
+def build_tensor_dataset(pairs: EncodedPairs | EncodedSequencePairs) -> TensorDataset:
+    if isinstance(pairs, EncodedSequencePairs):
+        return TensorDataset(
+            torch.from_numpy(pairs.conv_sequences),
+            torch.from_numpy(pairs.conv_masks),
+            torch.from_numpy(pairs.tool_sequences),
+            torch.from_numpy(pairs.tool_masks),
+            torch.from_numpy(pairs.labels),
+        )
+    return TensorDataset(
+        torch.from_numpy(pairs.features),
+        torch.from_numpy(pairs.labels),
+    )
+
+
 def train_one_epoch(
     *,
-    model: PairMLPRegressor,
+    model: PairMLPRegressor | LateInteractionRegressor,
     optimizer: torch.optim.Optimizer,
     loader: DataLoader,
-    full_train: EncodedPairs,
+    full_train: EncodedPairs | EncodedSequencePairs,
     config: dict[str, Any],
     device: torch.device,
 ) -> float:
     model.train()
     losses: list[float] = []
     criterion = torch.nn.SmoothL1Loss()
-    for features, labels in loader:
-        features = features.to(device)
-        labels = labels.to(device)
-        predictions = model(features)
+    for batch in loader:
+        predictions, labels = predict_batch(model, batch, device)
         loss = criterion(predictions, labels)
         optimizer.zero_grad()
         loss.backward()
@@ -150,9 +214,8 @@ def train_one_epoch(
     pairwise_weight = float(config["train"].get("pairwise_weight", 0.0))
     if pairwise_weight > 0:
         # One lightweight full-set ranking step per epoch; simple and easy to inspect.
-        features = torch.from_numpy(full_train.features).to(device)
         labels = torch.from_numpy(full_train.labels).to(device)
-        predictions = model(features)
+        predictions = predict_all(model, full_train, device)
         rank_loss = pairwise_margin_loss(
             predictions=predictions,
             labels=labels,
@@ -164,6 +227,41 @@ def train_one_epoch(
         optimizer.step()
         losses.append(float(rank_loss.detach().cpu()))
     return float(sum(losses) / max(1, len(losses)))
+
+
+def predict_batch(
+    model: PairMLPRegressor | LateInteractionRegressor,
+    batch: tuple[torch.Tensor, ...],
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if len(batch) == 2:
+        features, labels = batch
+        return model(features.to(device)), labels.to(device)
+    conv_seq, conv_mask, tool_seq, tool_mask, labels = batch
+    return (
+        model(
+            conv_seq.to(device),
+            conv_mask.to(device),
+            tool_seq.to(device),
+            tool_mask.to(device),
+        ),
+        labels.to(device),
+    )
+
+
+def predict_all(
+    model: PairMLPRegressor | LateInteractionRegressor,
+    pairs: EncodedPairs | EncodedSequencePairs,
+    device: torch.device,
+) -> torch.Tensor:
+    if isinstance(pairs, EncodedSequencePairs):
+        return model(
+            torch.from_numpy(pairs.conv_sequences).to(device),
+            torch.from_numpy(pairs.conv_masks).to(device),
+            torch.from_numpy(pairs.tool_sequences).to(device),
+            torch.from_numpy(pairs.tool_masks).to(device),
+        )
+    return model(torch.from_numpy(pairs.features).to(device))
 
 
 def pairwise_margin_loss(
@@ -195,14 +293,13 @@ def pairwise_margin_loss(
 
 @torch.no_grad()
 def evaluate(
-    model: PairMLPRegressor,
-    pairs: EncodedPairs,
+    model: PairMLPRegressor | LateInteractionRegressor,
+    pairs: EncodedPairs | EncodedSequencePairs,
     config: dict[str, Any],
     device: torch.device,
 ) -> dict[str, float]:
     model.eval()
-    features = torch.from_numpy(pairs.features).to(device)
-    predictions = model(features).cpu().numpy()
+    predictions = predict_all(model, pairs, device).cpu().numpy()
     eval_cfg = config["eval"]
     return compute_metrics(
         labels=pairs.labels,
@@ -217,12 +314,12 @@ def evaluate(
 @torch.no_grad()
 def write_predictions(
     path: Path,
-    model: PairMLPRegressor,
-    pairs: EncodedPairs,
+    model: PairMLPRegressor | LateInteractionRegressor,
+    pairs: EncodedPairs | EncodedSequencePairs,
     device: torch.device,
 ) -> None:
     model.eval()
-    predictions = model(torch.from_numpy(pairs.features).to(device)).cpu().numpy()
+    predictions = predict_all(model, pairs, device).cpu().numpy()
     with path.open("w", encoding="utf-8") as handle:
         for index, pred in enumerate(predictions):
             handle.write(
