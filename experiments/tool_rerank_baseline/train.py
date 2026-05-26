@@ -169,6 +169,9 @@ def main() -> None:
             f"val_mae={val_metrics['mae']:.4f} "
             f"val_top1={val_metrics['top1_match']:.3f} "
             f"val_top3={val_metrics['topk_recall']:.3f} "
+            f"val_ndcg5={val_metrics.get('ndcg_at_5', 0.0):.3f} "
+            f"val_regret5={val_metrics.get('top5_regret', 0.0):.3f} "
+            f"val_bad3={val_metrics.get('bad_top3_rate', 0.0):.3f} "
             f"val_no_tool_fp={val_metrics['no_tool_fp_rate']:.3f}"
         )
         score = val_metrics["topk_recall"] - val_metrics["no_tool_fp_rate"] - val_metrics["mae"]
@@ -176,6 +179,7 @@ def main() -> None:
             best_score = score
             best_report = row
             torch.save(model.state_dict(), run_dir / "best.pt")
+            write_predictions(run_dir / "best_val_predictions.jsonl", model, val_pairs, device)
 
     torch.save(model.state_dict(), run_dir / "last.pt")
     write_predictions(run_dir / "val_predictions.jsonl", model, val_pairs, device)
@@ -527,6 +531,7 @@ def evaluate(
         labels=pairs.labels,
         predictions=predictions,
         conversation_ids=pairs.conversation_ids,
+        tool_ids=pairs.tool_ids,
         high_label_threshold=float(eval_cfg.get("high_label_threshold", 0.8)),
         high_pred_threshold=float(eval_cfg.get("high_pred_threshold", 0.8)),
         topk=int(eval_cfg.get("topk", 3)),

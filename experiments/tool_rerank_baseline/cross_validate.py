@@ -181,7 +181,9 @@ def run_fold(
         print(
             f"[{run_dir.name} epoch {epoch:03d}] loss={train_loss:.4f} "
             f"val_mae={val_metrics['mae']:.4f} val_top1={val_metrics['top1_match']:.3f} "
-            f"val_top3={val_metrics['topk_recall']:.3f}"
+            f"val_top3={val_metrics['topk_recall']:.3f} "
+            f"val_ndcg5={val_metrics.get('ndcg_at_5', 0.0):.3f} "
+            f"val_regret5={val_metrics.get('top5_regret', 0.0):.3f}"
         )
         score = val_metrics["topk_recall"] - val_metrics["no_tool_fp_rate"] - val_metrics["mae"]
         if score > best_score:
@@ -252,6 +254,7 @@ def _evaluate_predictions(pairs: Any, predictions: torch.Tensor, config: dict[st
         labels=pairs.labels,
         predictions=predictions.detach().cpu().numpy(),
         conversation_ids=pairs.conversation_ids,
+        tool_ids=pairs.tool_ids,
         high_label_threshold=float(eval_cfg.get("high_label_threshold", 0.8)),
         high_pred_threshold=float(eval_cfg.get("high_pred_threshold", 0.8)),
         topk=int(eval_cfg.get("topk", 3)),
