@@ -24,7 +24,11 @@ hidden_dim = 256
 dropout = 0.1
 
 [lexical]
-enabled = false
+enabled = true
+word_max_features = 20000
+char_max_features = 20000
+bm25_k1 = 1.5
+bm25_b = 0.75
 
 [train]
 epochs = 12
@@ -41,5 +45,5 @@ high_pred_threshold = 1.0
 topk = 3
 
 [output]
-run_name = "jina_sequence_late_v2"
+run_name = "jina_sequence_lexical_v21"
 run_root = "experiments/tool_rerank_baseline/runs"

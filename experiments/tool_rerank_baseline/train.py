@@ -21,9 +21,11 @@ from metrics import append_jsonl, compute_metrics, write_json
 from model import (
     EncodedPairs,
     EncodedSequencePairs,
+    LexicalFeatureBuilder,
     LateInteractionRegressor,
     PairMLPRegressor,
     build_encoder,
+    build_lexical_features,
     build_pair_features,
     build_sequence_encoder,
 )
@@ -56,10 +58,31 @@ def main() -> None:
     if model_kind == "sequence_late_interaction":
         encoder = build_sequence_encoder(config)
         encoder.fit(fit_texts)
-        train_pairs = encode_sequence_examples(bundle.train_examples, encoder, config, split_name="train")
-        val_pairs = encode_sequence_examples(bundle.val_examples, encoder, config, split_name="val")
+        lexical_builder = build_lexical_features(config)
+        lexical_dim = 0
+        if lexical_builder is not None:
+            fit_conversations = sorted({example.conversation_text for example in bundle.train_examples})
+            fit_tools = sorted({example.tool_text for example in bundle.train_examples})
+            lexical_builder.fit(fit_conversations, fit_tools)
+            lexical_dim = lexical_builder.feature_dim
+            print(f"[lexical] enabled feature_dim={lexical_dim}")
+        train_pairs = encode_sequence_examples(
+            bundle.train_examples,
+            encoder,
+            config,
+            split_name="train",
+            lexical_builder=lexical_builder,
+        )
+        val_pairs = encode_sequence_examples(
+            bundle.val_examples,
+            encoder,
+            config,
+            split_name="val",
+            lexical_builder=lexical_builder,
+        )
         model = LateInteractionRegressor(
             hidden_size=train_pairs.conv_sequences.shape[-1],
+            lexical_dim=lexical_dim,
             hidden_dim=int(config["model"].get("hidden_dim", 256)),
             dropout=float(config["model"].get("dropout", 0.1)),
         ).to(device)
@@ -146,6 +169,7 @@ def encode_sequence_examples(
     config: dict[str, Any],
     *,
     split_name: str,
+    lexical_builder: LexicalFeatureBuilder | None = None,
 ) -> EncodedSequencePairs:
     batch_size = int(config["encoder"].get("batch_size", 8))
     unique_conversations = sorted({example.conversation_id: example.conversation_text for example in examples}.items())
@@ -164,11 +188,18 @@ def encode_sequence_examples(
     )
     conv_index = {conversation_id: index for index, conversation_id in enumerate(conversation_ids)}
     tool_index = {tool_id: index for index, tool_id in enumerate(tool_ids)}
+    lexical_features = None
+    if lexical_builder is not None:
+        lexical_features = lexical_builder.transform(
+            [example.conversation_text for example in examples],
+            [example.tool_text for example in examples],
+        )
     return EncodedSequencePairs(
         conv_sequences=np.asarray([conv_seq[conv_index[e.conversation_id]] for e in examples], dtype="float32"),
         conv_masks=np.asarray([conv_mask[conv_index[e.conversation_id]] for e in examples], dtype="bool"),
         tool_sequences=np.asarray([tool_seq[tool_index[e.tool_id]] for e in examples], dtype="float32"),
         tool_masks=np.asarray([tool_mask[tool_index[e.tool_id]] for e in examples], dtype="bool"),
+        lexical_features=lexical_features,
         labels=np.asarray([example.label for example in examples], dtype="float32"),
         conversation_ids=[example.conversation_id for example in examples],
         tool_ids=[example.tool_id for example in examples],
@@ -178,6 +209,15 @@ def encode_sequence_examples(
 
 def build_tensor_dataset(pairs: EncodedPairs | EncodedSequencePairs) -> TensorDataset:
     if isinstance(pairs, EncodedSequencePairs):
+        if pairs.lexical_features is not None:
+            return TensorDataset(
+                torch.from_numpy(pairs.conv_sequences),
+                torch.from_numpy(pairs.conv_masks),
+                torch.from_numpy(pairs.tool_sequences),
+                torch.from_numpy(pairs.tool_masks),
+                torch.from_numpy(pairs.lexical_features),
+                torch.from_numpy(pairs.labels),
+            )
         return TensorDataset(
             torch.from_numpy(pairs.conv_sequences),
             torch.from_numpy(pairs.conv_masks),
@@ -237,6 +277,18 @@ def predict_batch(
     if len(batch) == 2:
         features, labels = batch
         return model(features.to(device)), labels.to(device)
+    if len(batch) == 6:
+        conv_seq, conv_mask, tool_seq, tool_mask, lexical_features, labels = batch
+        return (
+            model(
+                conv_seq.to(device),
+                conv_mask.to(device),
+                tool_seq.to(device),
+                tool_mask.to(device),
+                lexical_features.to(device),
+            ),
+            labels.to(device),
+        )
     conv_seq, conv_mask, tool_seq, tool_mask, labels = batch
     return (
         model(
@@ -255,11 +307,17 @@ def predict_all(
     device: torch.device,
 ) -> torch.Tensor:
     if isinstance(pairs, EncodedSequencePairs):
+        lexical_features = (
+            torch.from_numpy(pairs.lexical_features).to(device)
+            if pairs.lexical_features is not None
+            else None
+        )
         return model(
             torch.from_numpy(pairs.conv_sequences).to(device),
             torch.from_numpy(pairs.conv_masks).to(device),
             torch.from_numpy(pairs.tool_sequences).to(device),
             torch.from_numpy(pairs.tool_masks).to(device),
+            lexical_features,
         )
     return model(torch.from_numpy(pairs.features).to(device))
 

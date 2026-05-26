@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
+from scipy import sparse
 from sklearn.decomposition import TruncatedSVD
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.preprocessing import normalize
@@ -158,6 +160,118 @@ class JinaSequenceEncoder:
         return self.cache_dir / f"{safe_key}.{digest}.npz"
 
 
+class LexicalFeatureBuilder:
+    def __init__(
+        self,
+        *,
+        word_max_features: int = 20000,
+        char_max_features: int = 20000,
+        bm25_k1: float = 1.5,
+        bm25_b: float = 0.75,
+    ) -> None:
+        self.word_vectorizer = TfidfVectorizer(
+            analyzer="word",
+            ngram_range=(1, 2),
+            max_features=word_max_features,
+            lowercase=True,
+            sublinear_tf=True,
+        )
+        self.char_vectorizer = TfidfVectorizer(
+            analyzer="char_wb",
+            ngram_range=(2, 5),
+            max_features=char_max_features,
+            lowercase=True,
+            sublinear_tf=True,
+        )
+        self.bm25_k1 = bm25_k1
+        self.bm25_b = bm25_b
+        self.avg_doc_len = 1.0
+        self.doc_freq: dict[str, int] = {}
+        self.doc_count = 0
+
+    def fit(self, conversation_texts: list[str], tool_texts: list[str]) -> None:
+        texts = conversation_texts + tool_texts
+        self.word_vectorizer.fit(texts)
+        self.char_vectorizer.fit(texts)
+
+        tool_token_sets = []
+        doc_lengths = []
+        for text in tool_texts:
+            tokens = _lex_tokens(text)
+            doc_lengths.append(len(tokens))
+            tool_token_sets.append(set(tokens))
+        self.doc_count = len(tool_texts)
+        self.avg_doc_len = float(sum(doc_lengths) / max(1, len(doc_lengths)))
+        self.doc_freq = {}
+        for token_set in tool_token_sets:
+            for token in token_set:
+                self.doc_freq[token] = self.doc_freq.get(token, 0) + 1
+
+    def transform(self, conversation_texts: list[str], tool_texts: list[str]) -> np.ndarray:
+        word_conv = self.word_vectorizer.transform(conversation_texts)
+        word_tool = self.word_vectorizer.transform(tool_texts)
+        char_conv = self.char_vectorizer.transform(conversation_texts)
+        char_tool = self.char_vectorizer.transform(tool_texts)
+        word_cos = _row_cosine(word_conv, word_tool)
+        char_cos = _row_cosine(char_conv, char_tool)
+
+        rows: list[list[float]] = []
+        for conv_text, tool_text, word_score, char_score in zip(
+            conversation_texts,
+            tool_texts,
+            word_cos,
+            char_cos,
+            strict=True,
+        ):
+            conv_tokens = _lex_tokens(conv_text)
+            tool_tokens = _lex_tokens(tool_text)
+            conv_set = set(conv_tokens)
+            tool_set = set(tool_tokens)
+            overlap = conv_set & tool_set
+            union = conv_set | tool_set
+            tool_id_tokens = set(_tool_id_tokens(tool_text))
+            bm25 = self._bm25(query_tokens=conv_tokens, doc_tokens=tool_tokens)
+            rows.append(
+                [
+                    float(word_score),
+                    float(char_score),
+                    float(bm25),
+                    len(overlap) / max(1, len(conv_set)),
+                    len(overlap) / max(1, len(tool_set)),
+                    len(overlap) / max(1, len(union)),
+                    len(conv_set & tool_id_tokens) / max(1, len(tool_id_tokens)),
+                    1.0 if conv_set & tool_id_tokens else 0.0,
+                ]
+            )
+        features = np.asarray(rows, dtype="float32")
+        features[:, 2] = np.log1p(features[:, 2])
+        return features
+
+    @property
+    def feature_dim(self) -> int:
+        return 8
+
+    def _bm25(self, *, query_tokens: list[str], doc_tokens: list[str]) -> float:
+        if not query_tokens or not doc_tokens:
+            return 0.0
+        tf: dict[str, int] = {}
+        for token in doc_tokens:
+            tf[token] = tf.get(token, 0) + 1
+        doc_len = len(doc_tokens)
+        score = 0.0
+        for token in set(query_tokens):
+            freq = tf.get(token, 0)
+            if not freq:
+                continue
+            df = self.doc_freq.get(token, 0)
+            idf = np.log(1.0 + (self.doc_count - df + 0.5) / (df + 0.5))
+            denom = freq + self.bm25_k1 * (
+                1.0 - self.bm25_b + self.bm25_b * doc_len / max(1.0, self.avg_doc_len)
+            )
+            score += idf * (freq * (self.bm25_k1 + 1.0)) / denom
+        return float(score)
+
+
 def build_encoder(config: dict[str, Any]) -> TfidfSvdEncoder | JinaEncoder:
     encoder_cfg = config["encoder"]
     backend = encoder_cfg.get("backend", "tfidf")
@@ -184,6 +298,18 @@ def build_sequence_encoder(config: dict[str, Any]) -> JinaSequenceEncoder:
         device=str(config.get("train", {}).get("device", "cpu")),
         max_length=int(encoder_cfg.get("max_length", 128)),
         cache_dir=Path(str(encoder_cfg["cache_dir"])) if encoder_cfg.get("cache_dir") else None,
+    )
+
+
+def build_lexical_features(config: dict[str, Any]) -> LexicalFeatureBuilder | None:
+    lexical_cfg = config.get("lexical", {})
+    if not lexical_cfg.get("enabled", False):
+        return None
+    return LexicalFeatureBuilder(
+        word_max_features=int(lexical_cfg.get("word_max_features", 20000)),
+        char_max_features=int(lexical_cfg.get("char_max_features", 20000)),
+        bm25_k1=float(lexical_cfg.get("bm25_k1", 1.5)),
+        bm25_b=float(lexical_cfg.get("bm25_b", 0.75)),
     )
 
 
@@ -214,6 +340,7 @@ class EncodedSequencePairs:
     conv_masks: np.ndarray
     tool_sequences: np.ndarray
     tool_masks: np.ndarray
+    lexical_features: np.ndarray | None
     labels: np.ndarray
     conversation_ids: list[str]
     tool_ids: list[str]
@@ -238,10 +365,17 @@ class PairMLPRegressor(nn.Module):
 
 
 class LateInteractionRegressor(nn.Module):
-    def __init__(self, *, hidden_size: int, hidden_dim: int = 256, dropout: float = 0.1) -> None:
+    def __init__(
+        self,
+        *,
+        hidden_size: int,
+        lexical_dim: int = 0,
+        hidden_dim: int = 256,
+        dropout: float = 0.1,
+    ) -> None:
         super().__init__()
         self.head = nn.Sequential(
-            nn.Linear(hidden_size * 4 + 6, hidden_dim),
+            nn.Linear(hidden_size * 4 + 6 + lexical_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout),
@@ -256,6 +390,7 @@ class LateInteractionRegressor(nn.Module):
         conv_mask: torch.Tensor,
         tool_seq: torch.Tensor,
         tool_mask: torch.Tensor,
+        lexical_features: torch.Tensor | None = None,
     ) -> torch.Tensor:
         conv_seq = torch.nn.functional.normalize(conv_seq, p=2, dim=-1)
         tool_seq = torch.nn.functional.normalize(tool_seq, p=2, dim=-1)
@@ -282,16 +417,10 @@ class LateInteractionRegressor(nn.Module):
             ],
             dim=1,
         )
-        features = torch.cat(
-            [
-                conv_pool,
-                tool_pool,
-                torch.abs(conv_pool - tool_pool),
-                conv_pool * tool_pool,
-                stats,
-            ],
-            dim=1,
-        )
+        parts = [conv_pool, tool_pool, torch.abs(conv_pool - tool_pool), conv_pool * tool_pool, stats]
+        if lexical_features is not None:
+            parts.append(lexical_features)
+        features = torch.cat(parts, dim=1)
         return self.head(features).squeeze(-1)
 
 
@@ -308,3 +437,19 @@ def _masked_topk_mean(values: torch.Tensor, mask: torch.Tensor, *, k: int) -> to
     topk = masked.topk(k=min(k, masked.shape[1]), dim=1).values
     valid = topk > -1e3
     return (topk.masked_fill(~valid, 0.0)).sum(dim=1) / valid.sum(dim=1).clamp_min(1)
+
+
+def _lex_tokens(text: str) -> list[str]:
+    return re.findall(r"[a-zA-Z0-9_]+|[\u4e00-\u9fff]", text.lower())
+
+
+def _tool_id_tokens(tool_text: str) -> list[str]:
+    first_line = tool_text.splitlines()[0] if tool_text else ""
+    if first_line.startswith("tool_id:"):
+        tool_id = first_line.split(":", 1)[1]
+        return [token for token in re.split(r"[^a-zA-Z0-9]+", tool_id.lower()) if token]
+    return []
+
+
+def _row_cosine(left: sparse.spmatrix, right: sparse.spmatrix) -> np.ndarray:
+    return np.asarray(left.multiply(right).sum(axis=1)).ravel().astype("float32")
