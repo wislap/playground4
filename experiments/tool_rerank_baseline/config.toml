@@ -1,0 +1,41 @@
+[data]
+run_dir = "data/runs/neko_v3_500"
+tool_universe_paths = [
+  "data/tool_universes/neko_real_v1",
+  "data/tool_universes/synthetic_plugins_v1",
+  "data/tool_universes/synthetic_plugins_v2",
+  "data/tool_universes/synthetic_plugins_v3",
+  "data/tool_universes/synthetic_plugins_v4",
+]
+val_ratio = 0.2
+seed = 20260526
+label_field = "confidence"
+
+[encoder]
+backend = "tfidf"
+model_name = "jinaai/jina-embeddings-v5-text-nano-retrieval"
+max_features = 12000
+dense_dim = 256
+batch_size = 64
+
+[model]
+hidden_dim = 256
+dropout = 0.1
+
+[train]
+epochs = 30
+batch_size = 256
+lr = 0.001
+weight_decay = 0.0001
+pairwise_weight = 0.2
+pairwise_margin = 0.1
+device = "cpu"
+
+[eval]
+high_label_threshold = 1.0
+high_pred_threshold = 1.0
+topk = 3
+
+[output]
+run_name = "tfidf_pair_mlp_v1"
+run_root = "experiments/tool_rerank_baseline/runs"

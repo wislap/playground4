@@ -3,6 +3,8 @@
 .ruff_cache/
 outputs/
 multirun/
+experiments/**/runs/*
+!experiments/**/runs/.gitkeep
 __pycache__/
 *.py[cod]
 dist/
