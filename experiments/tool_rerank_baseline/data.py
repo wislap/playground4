@@ -23,6 +23,7 @@ class PairExample:
     raw_score: float
     conversation_text: str
     tool_text: str
+    tool_fields: dict[str, str]
     scenario_type: str
     relevance_mode: str
 
@@ -42,6 +43,17 @@ class DatasetBundle:
 
 
 def load_dataset(config: dict[str, Any]) -> DatasetBundle:
+    all_groups = load_all_groups(config)
+    data_cfg = config["data"]
+    train_groups, val_groups = split_groups(
+        all_groups,
+        val_ratio=float(data_cfg.get("val_ratio", 0.2)),
+        seed=int(data_cfg.get("seed", 20260526)),
+    )
+    return bundle_from_groups(train_groups=train_groups, val_groups=val_groups)
+
+
+def load_all_groups(config: dict[str, Any]) -> list[ConversationGroup]:
     data_cfg = config["data"]
     run_dir = REPO_ROOT / data_cfg["run_dir"]
     tools = load_tool_universes(
@@ -74,6 +86,7 @@ def load_dataset(config: dict[str, Any]) -> DatasetBundle:
             raw_score=float(row.get("raw_score", 0.0)),
             conversation_text=render_conversation(conversation),
             tool_text=render_tool(tool.model_dump(mode="json")),
+            tool_fields=render_tool_fields(tool.model_dump(mode="json")),
             scenario_type=str(extra.get("scenario_type", "unknown")),
             relevance_mode=str(extra.get("tool_relevance_mode", "unknown")),
         )
@@ -83,11 +96,14 @@ def load_dataset(config: dict[str, Any]) -> DatasetBundle:
         ConversationGroup(conversation_id=conversation_id, examples=examples)
         for conversation_id, examples in sorted(grouped.items())
     ]
-    train_groups, val_groups = split_groups(
-        all_groups,
-        val_ratio=float(data_cfg.get("val_ratio", 0.2)),
-        seed=int(data_cfg.get("seed", 20260526)),
-    )
+    return all_groups
+
+
+def bundle_from_groups(
+    *,
+    train_groups: list[ConversationGroup],
+    val_groups: list[ConversationGroup],
+) -> DatasetBundle:
     return DatasetBundle(
         train_groups=train_groups,
         val_groups=val_groups,
@@ -137,6 +153,53 @@ def render_tool(tool: dict[str, Any]) -> str:
     if name:
         prefix += f"\nname: {name}"
     return f"{prefix}\n{tool['source_text']}"
+
+
+def render_tool_fields(tool: dict[str, Any]) -> dict[str, str]:
+    metadata = tool.get("metadata", {})
+    identity_parts = [
+        f"tool_id: {tool['tool_id']}",
+        f"kind: {tool['kind']}",
+    ]
+    for key in ("id", "name", "type"):
+        if metadata.get(key):
+            identity_parts.append(f"{key}: {metadata[key]}")
+
+    description_parts = []
+    for key in ("description", "short_description"):
+        if metadata.get(key):
+            description_parts.append(f"{key}: {metadata[key]}")
+    if not description_parts:
+        description_parts.append(str(tool["source_text"]))
+
+    capability_parts = []
+    for key in ("keywords", "capability_key", "method", "passive", "priority"):
+        value = metadata.get(key)
+        if value is None:
+            continue
+        if isinstance(value, list):
+            value = ", ".join(str(item) for item in value)
+        capability_parts.append(f"{key}: {value}")
+
+    examples_parts = []
+    for key in ("examples", "trigger_examples", "use_cases"):
+        value = metadata.get(key)
+        if value:
+            examples_parts.append(f"{key}: {value}")
+
+    schema_parts = []
+    for key in ("schema", "input_schema", "parameters"):
+        value = metadata.get(key)
+        if value:
+            schema_parts.append(f"{key}: {value}")
+
+    return {
+        "identity": "\n".join(identity_parts),
+        "description": "\n".join(description_parts),
+        "capabilities": "\n".join(capability_parts) or "\n".join(description_parts),
+        "examples": "\n".join(examples_parts) or "\n".join(description_parts),
+        "schema": "\n".join(schema_parts) or "\n".join(identity_parts),
+    }
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:

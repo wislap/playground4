@@ -347,6 +347,20 @@ class EncodedSequencePairs:
     raw_scores: np.ndarray
 
 
+@dataclass(frozen=True)
+class EncodedFieldSequencePairs:
+    field_names: list[str]
+    conv_sequences: np.ndarray
+    conv_masks: np.ndarray
+    field_sequences: dict[str, np.ndarray]
+    field_masks: dict[str, np.ndarray]
+    lexical_features: np.ndarray | None
+    labels: np.ndarray
+    conversation_ids: list[str]
+    tool_ids: list[str]
+    raw_scores: np.ndarray
+
+
 class PairMLPRegressor(nn.Module):
     def __init__(
         self,
@@ -474,6 +488,52 @@ class LateInteractionRegressor(nn.Module):
         return self.head(features).squeeze(-1)
 
 
+class FieldInteractionRegressor(nn.Module):
+    def __init__(
+        self,
+        *,
+        hidden_size: int,
+        field_names: list[str],
+        lexical_dim: int = 0,
+        hidden_dim: int = 256,
+        dropout: float = 0.1,
+        head: str = "mlp",
+    ) -> None:
+        super().__init__()
+        self.field_names = field_names
+        field_feature_dim = hidden_size * 4 + 6
+        input_dim = field_feature_dim * len(field_names) + lexical_dim
+        self.head = _build_head(
+            input_dim=input_dim,
+            hidden_dim=hidden_dim,
+            dropout=dropout,
+            head=head,
+        )
+
+    def forward(
+        self,
+        conv_seq: torch.Tensor,
+        conv_mask: torch.Tensor,
+        field_sequences: dict[str, torch.Tensor],
+        field_masks: dict[str, torch.Tensor],
+        lexical_features: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        parts = []
+        conv_seq = torch.nn.functional.normalize(conv_seq, p=2, dim=-1)
+        for field_name in self.field_names:
+            parts.append(
+                _late_interaction_features(
+                    conv_seq=conv_seq,
+                    conv_mask=conv_mask,
+                    tool_seq=field_sequences[field_name],
+                    tool_mask=field_masks[field_name],
+                )
+            )
+        if lexical_features is not None:
+            parts.append(lexical_features)
+        return self.head(torch.cat(parts, dim=1)).squeeze(-1)
+
+
 def _masked_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     return (values * mask.unsqueeze(-1)).sum(dim=1) / mask.sum(dim=1, keepdim=True).clamp_min(1.0)
 
@@ -503,6 +563,38 @@ def _masked_topk_mean(values: torch.Tensor, mask: torch.Tensor, *, k: int) -> to
     topk = masked.topk(k=min(k, masked.shape[1]), dim=1).values
     valid = topk > -1e3
     return (topk.masked_fill(~valid, 0.0)).sum(dim=1) / valid.sum(dim=1).clamp_min(1)
+
+
+def _late_interaction_features(
+    *,
+    conv_seq: torch.Tensor,
+    conv_mask: torch.Tensor,
+    tool_seq: torch.Tensor,
+    tool_mask: torch.Tensor,
+) -> torch.Tensor:
+    tool_seq = torch.nn.functional.normalize(tool_seq, p=2, dim=-1)
+    conv_mask_f = conv_mask.float()
+    tool_mask_f = tool_mask.float()
+
+    conv_pool = _masked_mean(conv_seq, conv_mask_f)
+    tool_pool = _masked_mean(tool_seq, tool_mask_f)
+    sim = torch.matmul(conv_seq, tool_seq.transpose(1, 2))
+    pair_mask = conv_mask.unsqueeze(2) & tool_mask.unsqueeze(1)
+    sim = sim.masked_fill(~pair_mask, -1e4)
+    conv_to_tool = sim.max(dim=2).values.masked_fill(~conv_mask, 0.0)
+    tool_to_conv = sim.max(dim=1).values.masked_fill(~tool_mask, 0.0)
+    stats = torch.stack(
+        [
+            _masked_scalar_mean(conv_to_tool, conv_mask_f),
+            conv_to_tool.max(dim=1).values,
+            _masked_topk_mean(conv_to_tool, conv_mask, k=5),
+            _masked_scalar_mean(tool_to_conv, tool_mask_f),
+            tool_to_conv.max(dim=1).values,
+            _masked_topk_mean(tool_to_conv, tool_mask, k=5),
+        ],
+        dim=1,
+    )
+    return torch.cat([conv_pool, tool_pool, torch.abs(conv_pool - tool_pool), conv_pool * tool_pool, stats], dim=1)
 
 
 def _lex_tokens(text: str) -> list[str]:
