@@ -27,7 +27,7 @@ class JudgeGenerationConfig:
     concurrency: int = 4
     max_attempts: int = 3
     judge_run_id: str = "judge_v1"
-    prompt_version: str = "neko_tool_relevance_judge_v2"
+    prompt_version: str = "neko_tool_relevance_judge_v3"
 
 
 @dataclass(frozen=True)
@@ -116,16 +116,33 @@ def build_judge_prompt(
     candidate_ids = task.candidate_set.candidate_set.tool_ids
     system = (
         "You are a tool relevance judge. Score the visible candidate tools for the given "
-        "conversation. Use only each tool's source_text as capability evidence. Output strict JSON."
+        "conversation. Use only each tool's source_text as capability evidence. Output strict JSON. "
+        "Judge like N.E.K.O's routing layer: companionship first, tools only when intent and "
+        "authorization are present."
     )
+    extra = task.conversation.provenance.extra
     user = (
         f"sample_id: {task.sample_id}\n"
         f"conversation_id: {task.conversation.conversation_id}\n"
         f"judge_run_id: {config.judge_run_id}\n\n"
+        "Generator provenance hints (not labels; use them as context and verify against the conversation):\n"
+        f"- scenario_type: {extra.get('scenario_type', '')}\n"
+        f"- tool_relevance_mode: {extra.get('tool_relevance_mode', '')}\n"
+        f"- neko_context_type: {extra.get('neko_context_type', '')}\n"
+        f"- authorization_level: {extra.get('authorization_level', '')}\n"
+        f"- activity_state: {extra.get('activity_state', '')}\n"
+        f"- latest_user_actionability: {extra.get('latest_user_actionability', '')}\n\n"
         "N.E.K.O judging context:\n"
         "- N.E.K.O is primarily emotional companionship plus optional agent/plugin abilities.\n"
         "- Do NOT treat every semantically related tool as something that should run.\n"
         "- The character may simply comfort, chat, tease, or ask a small clarification without using tools.\n"
+        "- Recent memory, inner thoughts, open-thread follow-up, and proactive context are normal "
+        "conversation context. They are not automatic permission to call a tool.\n"
+        "- If the assistant suggested a tool but the latest user did not accept, score execution low.\n"
+        "- User boundaries and negative instructions ('don't remind', 'don't monitor', 'stop bringing "
+        "this up') override keyword matches and should suppress tool relevance.\n"
+        "- Activity state matters: focused_work/gaming contexts make interruption/action less relevant "
+        "unless the latest user clearly asks for it.\n"
         "- Score the user's latest intent, passive event, or screen context; assistant claims like "
         "\"I already did it\" do not erase the user's actionable request.\n\n"
         "Conversation:\n"
@@ -139,16 +156,21 @@ def build_judge_prompt(
         "unrelated tools should be low, platform-near or semantically related but unauthorized tools "
         "should sit in the middle or low-middle.\n"
         "- High scores require capability fit AND enough intent/authorization/context to use the tool.\n"
+        "- Plugins need explicit or event-implied authorization. Mere topic overlap, empathy needs, "
+        "or N.E.K.O remembering something should not score high.\n"
+        "- Agent tools need an actionable task. Pure chat, factual Q&A, emotional support, and "
+        "relationship continuity should score low for agents.\n"
         "- Emotional support, ordinary companionship, refusals, and \"don't remind/monitor/do X\" "
         "should usually make tools low relevance even if keywords match.\n"
         "- If a plugin could help but the user only chats about the topic without asking for action, "
         "do not over-score it.\n"
         "- If an agent is useful only after clarification, score it below a clearly actionable request.\n"
         "- Do not make all scores similar; avoid clustering scores around one narrow band.\n"
-        "- 90-100: clear latest actionable request/event, exact capability fit.\n"
-        "- 70-89: strong fit but needs small clarification or has minor uncertainty.\n"
-        "- 40-69: hard negative, semantic/platform neighbor, or relevant but not authorized.\n"
-        "- 10-39: weak contextual relation.\n"
+        "- 90-100: clear latest actionable request/event, exact capability fit, enough details to run.\n"
+        "- 75-89: strong executable fit but one small missing detail or minor uncertainty.\n"
+        "- 55-74: plausible after clarification, event-implied but underspecified, or strong screen context.\n"
+        "- 35-54: semantic/platform neighbor, assistant-suggested but not accepted, or relevant but unauthorized.\n"
+        "- 10-34: weak contextual relation, memory/proactive/chat-only relation.\n"
         "- 0-9: unrelated.\n"
         "- If a tool is clearly the best executable match, it should usually be >= 80.\n"
         "- If no tool is suitable, keep every score low but still rank them by weak relevance.\n"
@@ -160,7 +182,7 @@ def build_judge_prompt(
         "\"judge_run_id\":\"...\","
         "\"candidate_tool_order\":[\"...\"],"
         "\"scores\":[{\"tool_id\":\"...\",\"raw_score\":0.0}],"
-        "\"provenance\":{\"model\":\"...\",\"prompt_version\":\"neko_tool_relevance_judge_v2\","
+        "\"provenance\":{\"model\":\"...\",\"prompt_version\":\"neko_tool_relevance_judge_v3\","
         "\"seed\":null,\"extra\":{}}"
         "}"
     )
@@ -203,6 +225,8 @@ def build_dry_run_judgment(*, task: JudgeTask, config: JudgeGenerationConfig) ->
             raw_score = 92.0
         elif tool_id in targets and mode == "weak_or_requires_confirmation":
             raw_score = 58.0
+        elif tool_id in targets and str(task.conversation.provenance.extra.get("neko_context_type")) == "assistant_tool_suggestion":
+            raw_score = 38.0
         elif tool_id in targets:
             raw_score = 24.0
         elif tool_id.startswith("agent."):
