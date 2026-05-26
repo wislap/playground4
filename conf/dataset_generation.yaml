@@ -1,0 +1,64 @@
+dataset:
+  id: tool_relevance_synth_v1
+  output_dir: data
+  seed: 42
+  train_ratio: 0.9
+  valid_ratio: 0.05
+  test_ratio: 0.05
+
+tool_universe:
+  id: neko_real_v1
+  path: data/tool_universes/neko_real_v1
+
+tool_classification:
+  taxonomy_version: tool_taxonomy_v1
+  path: data/tool_classifications/neko_real_v1.tool_taxonomy_v1.json
+
+generation:
+  num_conversations: 20000
+  target_tool_mode_ratio: 0.85
+  no_suitable_candidate_ratio: 0.12
+  languages:
+    zh-CN: 0.75
+    en-US: 0.20
+    mixed: 0.05
+  max_messages: 6
+
+candidate_sampling:
+  plugin_sample_rate: 0.10
+  target_force_rate: 0.80
+  weight_decay_on_select: 0.70
+  min_plugin_exposures: 50
+  min_plugin_targeted: 20
+  shuffle_candidates: true
+
+llm:
+  generator:
+    provider: relay
+    model: generator-model
+    temperature: 0.8
+    max_concurrency: 32
+    timeout_seconds: 90
+    retries: 3
+  judge:
+    provider: relay
+    model: judge-model
+    temperature: 0.0
+    max_concurrency: 16
+    timeout_seconds: 120
+    retries: 3
+    repeated_runs:
+      train: 1
+      valid: 2
+      test: 3
+
+calibration:
+  method: local_z_global_rank_gaussian
+  output_transform: latent
+  clip_percentile: 0.001
+
+quality:
+  require_high_confidence_ratio: 0.85
+  high_raw_score_threshold: 80
+  max_duplicate_similarity: 0.92
+  max_position_bias_delta: 20

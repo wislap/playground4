@@ -1,0 +1,19 @@
+[api]
+# OpenAI-compatible relay endpoint. Example: "https://your-relay.example/v1"
+base_url = "https://your-relay.example/v1"
+api_key = "sk-..."
+model = "your-generator-model"
+
+[generation]
+real_tool_universe = "data/tool_universes/neko_real_v1"
+existing_tool_universes = []
+taxonomy = "data/tool_classifications/neko_real_v1.tool_taxonomy_v1.json"
+output = "data/tool_universes/synthetic_plugins_v1"
+tool_universe_id = "synthetic_plugins_v1"
+count = 40
+batch_size = 10
+temperature = 0.8
+timeout_seconds = 120
+retries = 3
+# Optional: steer one synthetic shard toward underrepresented plugin styles.
+creative_brief = ""

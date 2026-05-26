@@ -1,0 +1,9 @@
+{
+  "conflicting_tool_ids": [],
+  "duplicate_tool_ids": [],
+  "forbidden_metadata_tool_ids": [],
+  "forbidden_source_text_tool_ids": [],
+  "non_plugin_tool_ids": [],
+  "ok": true,
+  "tool_count": 40
+}

@@ -1,0 +1,222 @@
+{
+  "categories": [
+    {
+      "generation_tags": [
+        "calendar",
+        "email",
+        "note",
+        "task"
+      ],
+      "kind": "plugin",
+      "primary_category": "productivity",
+      "secondary_categories": [],
+      "source": "heuristic",
+      "tool_id": "plugin.rss_digest"
+    },
+    {
+      "generation_tags": [
+        "calendar",
+        "email",
+        "note",
+        "task"
+      ],
+      "kind": "plugin",
+      "primary_category": "productivity",
+      "secondary_categories": [],
+      "source": "heuristic",
+      "tool_id": "plugin.calendar_assistant"
+    },
+    {
+      "generation_tags": [
+        "automation",
+        "calendar",
+        "desktop",
+        "email",
+        "note",
+        "os",
+        "task"
+      ],
+      "kind": "plugin",
+      "primary_category": "productivity",
+      "secondary_categories": [
+        "local_system"
+      ],
+      "source": "heuristic",
+      "tool_id": "plugin.steam_game_monitor"
+    },
+    {
+      "generation_tags": [
+        "analysis",
+        "automation",
+        "browser",
+        "data",
+        "desktop",
+        "document",
+        "download",
+        "file",
+        "os",
+        "pdf",
+        "read_write",
+        "search",
+        "table",
+        "web"
+      ],
+      "kind": "plugin",
+      "primary_category": "web_retrieval",
+      "secondary_categories": [
+        "file_document",
+        "data_analysis",
+        "local_system"
+      ],
+      "source": "heuristic",
+      "tool_id": "plugin.pdf_reader"
+    },
+    {
+      "generation_tags": [
+        "analysis",
+        "browser",
+        "calendar",
+        "data",
+        "download",
+        "email",
+        "note",
+        "search",
+        "table",
+        "task",
+        "web"
+      ],
+      "kind": "plugin",
+      "primary_category": "web_retrieval",
+      "secondary_categories": [
+        "productivity",
+        "data_analysis"
+      ],
+      "source": "heuristic",
+      "tool_id": "plugin.email_bridge"
+    },
+    {
+      "generation_tags": [],
+      "kind": "plugin",
+      "primary_category": "other",
+      "secondary_categories": [],
+      "source": "heuristic",
+      "tool_id": "plugin.server_watchdog"
+    },
+    {
+      "generation_tags": [
+        "calendar",
+        "email",
+        "note",
+        "task"
+      ],
+      "kind": "plugin",
+      "primary_category": "productivity",
+      "secondary_categories": [],
+      "source": "heuristic",
+      "tool_id": "plugin.daily_briefing"
+    },
+    {
+      "generation_tags": [
+        "calendar",
+        "chat",
+        "email",
+        "message",
+        "note",
+        "social",
+        "task"
+      ],
+      "kind": "plugin",
+      "primary_category": "productivity",
+      "secondary_categories": [
+        "communication"
+      ],
+      "source": "heuristic",
+      "tool_id": "plugin.wechat_work_bridge"
+    },
+    {
+      "generation_tags": [
+        "automation",
+        "browser",
+        "desktop",
+        "download",
+        "image",
+        "media",
+        "os",
+        "search",
+        "vision",
+        "web"
+      ],
+      "kind": "plugin",
+      "primary_category": "web_retrieval",
+      "secondary_categories": [
+        "image_media",
+        "local_system"
+      ],
+      "source": "heuristic",
+      "tool_id": "plugin.home_media_center"
+    },
+    {
+      "generation_tags": [
+        "analysis",
+        "automation",
+        "browser",
+        "calendar",
+        "code",
+        "data",
+        "desktop",
+        "developer",
+        "document",
+        "download",
+        "email",
+        "file",
+        "note",
+        "os",
+        "pdf",
+        "read_write",
+        "repository",
+        "search",
+        "table",
+        "task",
+        "web"
+      ],
+      "kind": "plugin",
+      "primary_category": "web_retrieval",
+      "secondary_categories": [
+        "file_document",
+        "code_dev",
+        "productivity",
+        "data_analysis",
+        "local_system"
+      ],
+      "source": "heuristic",
+      "tool_id": "plugin.code_workspace_assistant"
+    },
+    {
+      "generation_tags": [
+        "calendar",
+        "email",
+        "note",
+        "task"
+      ],
+      "kind": "plugin",
+      "primary_category": "productivity",
+      "secondary_categories": [],
+      "source": "heuristic",
+      "tool_id": "plugin.podcast_digest"
+    },
+    {
+      "generation_tags": [
+        "analysis",
+        "data",
+        "table"
+      ],
+      "kind": "plugin",
+      "primary_category": "data_analysis",
+      "secondary_categories": [],
+      "source": "heuristic",
+      "tool_id": "plugin.fitness_coach"
+    }
+  ],
+  "taxonomy_version": "tool_taxonomy_v1",
+  "tool_universe_id": "synthetic_plugins_v1"
+}

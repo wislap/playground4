@@ -1,0 +1,11 @@
+.venv/
+.pytest_cache/
+.ruff_cache/
+outputs/
+multirun/
+__pycache__/
+*.py[cod]
+dist/
+build/
+*.egg-info/
+conf/synthetic_plugin_generation.toml
