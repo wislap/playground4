@@ -70,6 +70,7 @@ async def run_resumable_jobs(
     lock = asyncio.Lock()
     succeeded = 0
     failed = 0
+    succeeded_ids: set[str] = set()
 
     async def run_one(item: ItemT) -> None:
         current_id = item_id(item)
@@ -101,6 +102,9 @@ async def run_resumable_jobs(
                 if row is not None:
                     append_jsonl(output_path, [row])
                     succeeded += 1
+                    row_id = completed_id(row.model_dump(mode="json") if isinstance(row, BaseModel) else row)
+                    if row_id is not None:
+                        succeeded_ids.add(row_id)
                 elif error is not None:
                     append_jsonl(error_path, [error.to_dict()])
                     failed += 1
@@ -108,6 +112,8 @@ async def run_resumable_jobs(
             progress.set_postfix(done=len(completed) + succeeded + failed, failed=failed)
     finally:
         progress.close()
+
+    prune_resolved_errors(error_path, completed | succeeded_ids)
 
     return ResumableRunSummary(
         total=len(item_list),
@@ -119,6 +125,25 @@ async def run_resumable_jobs(
         output_path=str(output_path),
         error_path=str(error_path),
     )
+
+
+def prune_resolved_errors(error_path: Path, completed_ids: set[str]) -> int:
+    if not error_path.exists() or not completed_ids:
+        return 0
+    kept: list[dict] = []
+    pruned = 0
+    for row in read_jsonl(error_path):
+        item_id = row.get("item_id")
+        if item_id in completed_ids:
+            pruned += 1
+            continue
+        kept.append(row)
+    if pruned:
+        error_path.write_text(
+            "".join(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n" for row in kept),
+            encoding="utf-8",
+        )
+    return pruned
 
 
 def _completed_ids(path: Path, completed_id: Callable[[dict], str | None]) -> set[str]:

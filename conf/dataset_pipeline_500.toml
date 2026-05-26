@@ -1,0 +1,47 @@
+[run]
+run_id = "neko_v3_500"
+output_root = "data"
+seed = 20260526
+max_attempts = 3
+
+[tool_universe]
+id = "runtime_tool_pool_v4"
+paths = [
+  "data/tool_universes/neko_real_v1",
+  "data/tool_universes/synthetic_plugins_v1",
+  "data/tool_universes/synthetic_plugins_v2",
+  "data/tool_universes/synthetic_plugins_v3",
+  "data/tool_universes/synthetic_plugins_v4",
+]
+
+[generation]
+count = 500
+targets_per_conversation = 1
+concurrency = 6
+
+[candidate_sampling]
+plugin_sample_rate = 0.10
+target_force_rate = 1.0
+weight_decay_on_select = 0.70
+concurrency = 1
+
+[llm.generator]
+base_url = 'https://api.imgwwo.top/v1'
+api_key = 'sk-8020b80c06c8af8f1c637561455e7fe5e41e83a238c60608d01bc605ef889ed9'
+model = 'gpt-5.5'
+temperature = 0.9
+timeout_seconds = 120
+retries = 3
+
+[llm.judge]
+base_url = 'https://api.imgwwo.top/v1'
+api_key = 'sk-8020b80c06c8af8f1c637561455e7fe5e41e83a238c60608d01bc605ef889ed9'
+model = 'gpt-5.5'
+temperature = 0.2
+timeout_seconds = 120
+retries = 3
+concurrency = 8
+judge_run_id = "judge_v3"
+
+[calibration]
+clip_percentile = 0.001

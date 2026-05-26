@@ -190,7 +190,8 @@ async def generate_conversations(
             response_format={"type": "json_object"},
         )
         response = await client.complete(request)
-        record = ConversationRecord.model_validate(_json_object_from_text(response.text))
+        payload = _sanitize_conversation_payload(_json_object_from_text(response.text))
+        record = ConversationRecord.model_validate(payload)
         return normalize_conversation_record(record, task=task, config=config)
 
     return await run_resumable_jobs(
@@ -274,6 +275,42 @@ def normalize_conversation_record(
             },
         ),
     )
+
+
+def _sanitize_conversation_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Normalize common LLM JSON drift before strict schema validation."""
+    messages = payload.get("messages")
+    if not isinstance(messages, list):
+        return payload
+
+    normalized_messages: list[Any] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            normalized_messages.append(message)
+            continue
+        normalized = dict(message)
+        attachments = normalized.get("attachments", [])
+        if attachments is None:
+            normalized["attachments"] = []
+        elif isinstance(attachments, list):
+            normalized["attachments"] = [_stringify_attachment(item) for item in attachments]
+        else:
+            normalized["attachments"] = [_stringify_attachment(attachments)]
+        normalized_messages.append(normalized)
+    return {**payload, "messages": normalized_messages}
+
+
+def _stringify_attachment(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        name = value.get("name") or value.get("filename") or value.get("title") or value.get("type")
+        kind = value.get("type") or value.get("mime_type")
+        if name and kind and str(kind) not in str(name):
+            return f"{name} ({kind})"
+        if name:
+            return str(name)
+    return json.dumps(value, ensure_ascii=False, sort_keys=True)
 
 
 def _choose_targets_for_scenario(

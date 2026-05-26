@@ -90,3 +90,19 @@ uv run python -m tool_relevance_lab.dataset_generation.run classify-tools \
   --tool-universe-id runtime_tool_pool_v1 \
   --output data/tool_classifications/runtime_tool_pool_v1.tool_taxonomy_v1.json
 ```
+
+Run the resumable end-to-end dataset pipeline:
+
+```bash
+cp conf/dataset_pipeline_500.example.toml conf/dataset_pipeline_500.toml
+# Fill llm.generator / llm.judge or set CONV_GEN_* and JUDGE_* env vars.
+uv run python -m tool_relevance_lab.dataset_generation.run run-pipeline \
+  --config conf/dataset_pipeline_500.toml
+```
+
+The pipeline runs stages serially and parallelizes inside the LLM-heavy stages:
+
+`conversations -> candidate_sets -> judgments -> calibrated -> quality_report`
+
+Outputs are grouped under `data/runs/<run_id>/` and can be resumed by rerunning the
+same command.

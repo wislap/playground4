@@ -28,6 +28,10 @@ from tool_relevance_lab.dataset_generation.candidate_generation import (
 from tool_relevance_lab.dataset_generation.jsonl import read_model_jsonl, write_jsonl
 from tool_relevance_lab.dataset_generation.judging import JudgeGenerationConfig, judge_candidate_sets
 from tool_relevance_lab.dataset_generation.llm import OpenAICompatibleConfig, OpenAICompatibleLLMClient
+from tool_relevance_lab.dataset_generation.pipeline import (
+    load_pipeline_config,
+    run_dataset_pipeline,
+)
 from tool_relevance_lab.dataset_generation.quality import summarize_quality
 from tool_relevance_lab.dataset_generation.schemas import (
     CandidateSetRecord,
@@ -125,6 +129,10 @@ def main() -> None:
     smoke_parser.add_argument("--count", type=int, default=20)
     smoke_parser.add_argument("--concurrency", type=int, default=4)
     smoke_parser.add_argument("--fail-every", type=int, default=0)
+
+    pipeline_parser = subparsers.add_parser("run-pipeline")
+    pipeline_parser.add_argument("--config", type=Path, required=True)
+    pipeline_parser.add_argument("--dry-run", action="store_true")
 
     conversation_parser = subparsers.add_parser("generate-conversations")
     conversation_parser.add_argument("--tool-universe", type=Path, action="append", required=True)
@@ -345,6 +353,12 @@ def main() -> None:
         if args.summary:
             write_run_summary(args.summary, summary)
         print(json.dumps(summary.to_dict(), ensure_ascii=False, indent=2, sort_keys=True))
+        return
+
+    if args.command == "run-pipeline":
+        config = load_pipeline_config(args.config)
+        result = asyncio.run(run_dataset_pipeline(config=config, dry_run=args.dry_run))
+        print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2, sort_keys=True))
         return
 
     if args.command == "generate-conversations":

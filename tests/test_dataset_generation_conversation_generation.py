@@ -4,6 +4,7 @@ import pytest
 
 from tool_relevance_lab.dataset_generation.conversation_generation import (
     ConversationGenerationConfig,
+    _sanitize_conversation_payload,
     build_conversation_tasks,
     generate_conversations,
 )
@@ -46,6 +47,29 @@ def test_build_conversation_tasks_is_stable() -> None:
         "conv_000003",
     ]
     assert all(task.scenario_type for task in first)
+
+
+def test_sanitize_conversation_payload_normalizes_attachment_objects() -> None:
+    payload = {
+        "conversation_id": "conv_000001",
+        "messages": [
+            {
+                "role": "user",
+                "text": "帮我看这两个文件",
+                "attachments": [
+                    {"name": "eval_A.csv", "type": "text/csv"},
+                    {"filename": "screen.png", "mime_type": "image/png"},
+                ],
+            }
+        ],
+    }
+
+    sanitized = _sanitize_conversation_payload(payload)
+
+    assert sanitized["messages"][0]["attachments"] == [
+        "eval_A.csv (text/csv)",
+        "screen.png (image/png)",
+    ]
 
 
 @pytest.mark.anyio
