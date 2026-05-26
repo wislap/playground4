@@ -19,28 +19,18 @@ batch_size = 8
 cache_dir = "experiments/tool_rerank_baseline/cache"
 
 [model]
-kind = "sequence_late_interaction"
-head = "mlp"
-hidden_dim = 256
-dropout = 0.1
+kind = "ridge_late_interaction"
 
 [lexical]
 enabled = true
-fusion = "gated_add"
-dropout = 0.05
 word_max_features = 20000
 char_max_features = 20000
 bm25_k1 = 1.5
 bm25_b = 0.75
 
-[train]
-epochs = 12
-batch_size = 64
-lr = 0.001
-weight_decay = 0.0001
-pairwise_weight = 0.2
-pairwise_margin = 0.1
-device = "cpu"
+[ridge]
+feature_batch_size = 256
+alphas = [0.001, 0.003, 0.01, 0.03, 0.1, 0.3, 1.0, 3.0, 10.0, 30.0, 100.0, 300.0, 1000.0]
 
 [eval]
 high_label_threshold = 1.0
@@ -48,5 +38,5 @@ high_pred_threshold = 1.0
 topk = 3
 
 [output]
-run_name = "jina_sequence_lexical_gated_v22b"
+run_name = "jina_sequence_lexical_ridge_v21"
 run_root = "experiments/tool_rerank_baseline/runs"

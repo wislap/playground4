@@ -20,14 +20,12 @@ cache_dir = "experiments/tool_rerank_baseline/cache"
 
 [model]
 kind = "sequence_late_interaction"
-head = "mlp"
+head = "linear"
 hidden_dim = 256
 dropout = 0.1
 
 [lexical]
 enabled = true
-fusion = "gated_add"
-dropout = 0.05
 word_max_features = 20000
 char_max_features = 20000
 bm25_k1 = 1.5
@@ -48,5 +46,5 @@ high_pred_threshold = 1.0
 topk = 3
 
 [output]
-run_name = "jina_sequence_lexical_gated_v22b"
+run_name = "jina_sequence_lexical_linear_v21"
 run_root = "experiments/tool_rerank_baseline/runs"

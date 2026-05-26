@@ -348,16 +348,20 @@ class EncodedSequencePairs:
 
 
 class PairMLPRegressor(nn.Module):
-    def __init__(self, *, input_dim: int, hidden_dim: int = 256, dropout: float = 0.1) -> None:
+    def __init__(
+        self,
+        *,
+        input_dim: int,
+        hidden_dim: int = 256,
+        dropout: float = 0.1,
+        head: str = "mlp",
+    ) -> None:
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.GELU(),
-            nn.Linear(hidden_dim // 2, 1),
+        self.net = _build_head(
+            input_dim=input_dim,
+            hidden_dim=hidden_dim,
+            dropout=dropout,
+            head=head,
         )
 
     def forward(self, features: torch.Tensor) -> torch.Tensor:
@@ -374,6 +378,7 @@ class LateInteractionRegressor(nn.Module):
         lexical_dropout: float = 0.0,
         hidden_dim: int = 256,
         dropout: float = 0.1,
+        head: str = "mlp",
     ) -> None:
         super().__init__()
         semantic_dim = hidden_size * 4 + 6
@@ -407,14 +412,11 @@ class LateInteractionRegressor(nn.Module):
             head_input_dim = semantic_dim
         else:
             raise ValueError(f"unknown lexical_fusion: {lexical_fusion}")
-        self.head = nn.Sequential(
-            nn.Linear(head_input_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.GELU(),
-            nn.Linear(hidden_dim // 2, 1),
+        self.head = _build_head(
+            input_dim=head_input_dim,
+            hidden_dim=hidden_dim,
+            dropout=dropout,
+            head=head,
         )
 
     def forward(
@@ -474,6 +476,22 @@ class LateInteractionRegressor(nn.Module):
 
 def _masked_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     return (values * mask.unsqueeze(-1)).sum(dim=1) / mask.sum(dim=1, keepdim=True).clamp_min(1.0)
+
+
+def _build_head(*, input_dim: int, hidden_dim: int, dropout: float, head: str) -> nn.Module:
+    if head == "linear":
+        return nn.Linear(input_dim, 1)
+    if head == "mlp":
+        return nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.GELU(),
+            nn.Linear(hidden_dim // 2, 1),
+        )
+    raise ValueError(f"unknown model.head: {head}")
 
 
 def _masked_scalar_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:

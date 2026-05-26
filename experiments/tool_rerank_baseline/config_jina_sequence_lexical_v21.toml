@@ -20,6 +20,7 @@ cache_dir = "experiments/tool_rerank_baseline/cache"
 
 [model]
 kind = "sequence_late_interaction"
+head = "mlp"
 hidden_dim = 256
 dropout = 0.1
 

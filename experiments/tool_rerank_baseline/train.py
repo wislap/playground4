@@ -87,6 +87,7 @@ def main() -> None:
             lexical_dropout=float(config.get("lexical", {}).get("dropout", 0.0)),
             hidden_dim=int(config["model"].get("hidden_dim", 256)),
             dropout=float(config["model"].get("dropout", 0.1)),
+            head=str(config["model"].get("head", "mlp")),
         ).to(device)
     else:
         encoder = build_encoder(config)
@@ -97,6 +98,7 @@ def main() -> None:
             input_dim=train_pairs.features.shape[1],
             hidden_dim=int(config["model"].get("hidden_dim", 256)),
             dropout=float(config["model"].get("dropout", 0.1)),
+            head=str(config["model"].get("head", "mlp")),
         ).to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(),
