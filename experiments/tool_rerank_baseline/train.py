@@ -360,13 +360,19 @@ def train_one_epoch(
     model.train()
     losses: list[float] = []
     criterion = torch.nn.SmoothL1Loss()
-    for batch in loader:
+    grad_accum_steps = max(1, int(config["train"].get("grad_accum_steps", 1)))
+    optimizer.zero_grad()
+    for step, batch in enumerate(loader, start=1):
         predictions, labels = predict_batch(model, batch, device)
         loss = criterion(predictions, labels)
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+        (loss / grad_accum_steps).backward()
+        if step % grad_accum_steps == 0:
+            optimizer.step()
+            optimizer.zero_grad()
         losses.append(float(loss.detach().cpu()))
+    if len(loader) % grad_accum_steps != 0:
+        optimizer.step()
+        optimizer.zero_grad()
 
     pairwise_weight = float(config["train"].get("pairwise_weight", 0.0))
     if pairwise_weight > 0:
