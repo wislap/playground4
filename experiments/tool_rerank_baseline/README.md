@@ -2,65 +2,51 @@
 
 Research-first baseline for N.E.K.O tool relevance training.
 
-The first loop is intentionally small:
+Current training policy: all model training must go through grouped 5-fold
+cross-validation. Single split training, repeated seed runners, parallel ad-hoc
+runners, ridge sweeps, and non-CV training configs have been removed to keep
+validation strict and comparable.
+
+The active loop is:
 
 ```text
 data/runs/neko_v3_500
-  -> grouped pair examples
-  -> TF-IDF/SVD pair MLP, or Jina token sequence late interaction
-  -> optional lexical side-channel: word/char ngram cosine + BM25 + token overlap
-  -> confidence regressor
+  -> grouped conversation-level pair examples
+  -> fixed holdout groups excluded from CV
+  -> 5-fold CV over the CV group pool
+  -> shared frozen Jina sequence encoding for the CV training pool
+  -> fold-local lexical features fit only on that fold's training groups
+  -> sequence late-interaction regressor with gated lexical fusion
+  -> per-fold checkpoint evaluation and aggregate CV report
 ```
 
-Run data inspection:
+Inspect data:
 
 ```bash
 uv run python experiments/tool_rerank_baseline/inspect_data.py \
-  --config experiments/tool_rerank_baseline/config.toml
+  --config experiments/tool_rerank_baseline/config_jina_sequence_lexical_gated_v22b_cv.toml
 ```
 
-Run training:
+Run 5-fold CV on CPU:
 
 ```bash
-uv run python experiments/tool_rerank_baseline/train.py \
-  --config experiments/tool_rerank_baseline/config.toml
+uv run python experiments/tool_rerank_baseline/cross_validate.py \
+  --config experiments/tool_rerank_baseline/config_jina_sequence_lexical_gated_v22b_cv.toml
 ```
 
-Run the cached Jina sequence baseline:
+Run 5-fold CV on GPU:
 
 ```bash
-uv run python experiments/tool_rerank_baseline/train.py \
-  --config experiments/tool_rerank_baseline/config_jina_sequence_v2.toml
+uv run python experiments/tool_rerank_baseline/cross_validate.py \
+  --config experiments/tool_rerank_baseline/config_jina_sequence_lexical_gated_v22b_cv_gpu.toml
 ```
 
-Run Jina sequence plus lexical side-channel:
-
-```bash
-uv run python experiments/tool_rerank_baseline/train.py \
-  --config experiments/tool_rerank_baseline/config_jina_sequence_lexical_v21.toml
-```
-
-Run gated lexical fusion with lexical feature dropout:
-
-```bash
-uv run python experiments/tool_rerank_baseline/train.py \
-  --config experiments/tool_rerank_baseline/config_jina_sequence_lexical_gated_v22.toml
-```
-
-Run gated lexical concat, which keeps lexical evidence explicit but scales it
-with a learned gate:
-
-```bash
-uv run python experiments/tool_rerank_baseline/train.py \
-  --config experiments/tool_rerank_baseline/config_jina_sequence_lexical_gated_concat_v23.toml
-```
-
-Analyze a finished run:
+Analyze a finished fold or run directory:
 
 ```bash
 uv run python experiments/tool_rerank_baseline/analyze_run.py \
-  --run-dir experiments/tool_rerank_baseline/runs/tfidf_pair_mlp_v1
+  --run-dir experiments/tool_rerank_baseline/runs/jina_sequence_lexical_gated_v22b_cv/fold_01
 ```
 
-Use `encoder.backend = "jina"` or `"jina_sequence"` when local model loading is ready.
-Keep `tfidf` as the no-download fallback for quick iteration.
+`training_core.py` is internal library code used by `cross_validate.py`; it is
+not a training entrypoint.

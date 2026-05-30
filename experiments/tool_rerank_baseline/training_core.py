@@ -1,11 +1,8 @@
 from __future__ import annotations
 
-import argparse
 import json
 import random
-import shutil
 import sys
-import tomllib
 from pathlib import Path
 from typing import Any
 
@@ -16,7 +13,7 @@ from torch.utils.data import DataLoader, TensorDataset
 if str(Path(__file__).parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).parent))
 
-from data import PairExample, load_dataset
+from data import PairExample
 from metrics import append_jsonl, compute_metrics, write_json
 from model import (
     EncodedFieldSequencePairs,
@@ -26,169 +23,8 @@ from model import (
     LexicalFeatureBuilder,
     LateInteractionRegressor,
     PairMLPRegressor,
-    build_encoder,
-    build_lexical_features,
     build_pair_features,
-    build_sequence_encoder,
 )
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=Path, required=True)
-    args = parser.parse_args()
-    config = tomllib.loads(args.config.read_text(encoding="utf-8"))
-    set_seed(int(config["data"].get("seed", 20260526)))
-
-    run_dir = Path(config["output"]["run_root"]) / config["output"]["run_name"]
-    run_dir.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(args.config, run_dir / "config.resolved.toml")
-
-    bundle = load_dataset(config)
-    print(
-        f"[data] train_groups={len(bundle.train_groups)} val_groups={len(bundle.val_groups)} "
-        f"train_pairs={len(bundle.train_examples)} val_pairs={len(bundle.val_examples)}"
-    )
-
-    device = torch.device(config["train"].get("device", "cpu"))
-    model_kind = config.get("model", {}).get("kind", "pair_mlp")
-    fit_texts = sorted(
-        {example.conversation_text for example in bundle.train_examples}
-        | {example.tool_text for example in bundle.train_examples}
-    )
-    print(f"[encoder] backend={config['encoder']['backend']} fit_texts={len(fit_texts)}")
-    if model_kind in {"sequence_late_interaction", "field_interaction"}:
-        encoder = build_sequence_encoder(config)
-        encoder.fit(fit_texts)
-        lexical_builder = build_lexical_features(config)
-        lexical_dim = 0
-        if lexical_builder is not None:
-            fit_conversations = sorted({example.conversation_text for example in bundle.train_examples})
-            fit_tools = sorted({example.tool_text for example in bundle.train_examples})
-            lexical_builder.fit(fit_conversations, fit_tools)
-            lexical_dim = lexical_builder.feature_dim
-            print(f"[lexical] enabled feature_dim={lexical_dim}")
-        if model_kind == "field_interaction":
-            field_names = list(config["model"].get("field_names", _default_field_names()))
-            train_pairs = encode_field_sequence_examples(
-                bundle.train_examples,
-                encoder,
-                config,
-                split_name="train",
-                field_names=field_names,
-                lexical_builder=lexical_builder,
-            )
-            val_pairs = encode_field_sequence_examples(
-                bundle.val_examples,
-                encoder,
-                config,
-                split_name="val",
-                field_names=field_names,
-                lexical_builder=lexical_builder,
-            )
-            model = FieldInteractionRegressor(
-                hidden_size=train_pairs.conv_sequences.shape[-1],
-                field_names=field_names,
-                lexical_dim=lexical_dim,
-                hidden_dim=int(config["model"].get("hidden_dim", 256)),
-                dropout=float(config["model"].get("dropout", 0.1)),
-                head=str(config["model"].get("head", "mlp")),
-            ).to(device)
-        else:
-            train_pairs = encode_sequence_examples(
-                bundle.train_examples,
-                encoder,
-                config,
-                split_name="train",
-                lexical_builder=lexical_builder,
-            )
-            val_pairs = encode_sequence_examples(
-                bundle.val_examples,
-                encoder,
-                config,
-                split_name="val",
-                lexical_builder=lexical_builder,
-            )
-            model = LateInteractionRegressor(
-                hidden_size=train_pairs.conv_sequences.shape[-1],
-                lexical_dim=lexical_dim,
-                lexical_fusion=str(config.get("lexical", {}).get("fusion", "concat")),
-                lexical_dropout=float(config.get("lexical", {}).get("dropout", 0.0)),
-                hidden_dim=int(config["model"].get("hidden_dim", 256)),
-                dropout=float(config["model"].get("dropout", 0.1)),
-                head=str(config["model"].get("head", "mlp")),
-            ).to(device)
-    else:
-        encoder = build_encoder(config)
-        encoder.fit(fit_texts)
-        train_pairs = encode_examples(bundle.train_examples, encoder, config)
-        val_pairs = encode_examples(bundle.val_examples, encoder, config)
-        model = PairMLPRegressor(
-            input_dim=train_pairs.features.shape[1],
-            hidden_dim=int(config["model"].get("hidden_dim", 256)),
-            dropout=float(config["model"].get("dropout", 0.1)),
-            head=str(config["model"].get("head", "mlp")),
-        ).to(device)
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=float(config["train"].get("lr", 1e-3)),
-        weight_decay=float(config["train"].get("weight_decay", 1e-4)),
-    )
-    train_loader = DataLoader(
-        build_tensor_dataset(train_pairs),
-        batch_size=int(config["train"].get("batch_size", 256)),
-        shuffle=True,
-    )
-
-    primary_objective = str(config["train"].get("checkpoint_objective", "composite"))
-    best_states = init_best_states(primary_objective)
-    metrics_path = run_dir / "metrics.jsonl"
-    if metrics_path.exists():
-        metrics_path.unlink()
-
-    for epoch in range(1, int(config["train"].get("epochs", 30)) + 1):
-        train_loss = train_one_epoch(
-            model=model,
-            optimizer=optimizer,
-            loader=train_loader,
-            full_train=train_pairs,
-            config=config,
-            device=device,
-        )
-        train_metrics = evaluate(model, train_pairs, config, device)
-        val_metrics = evaluate(model, val_pairs, config, device)
-        row = {
-            "epoch": epoch,
-            "train_loss": train_loss,
-            "train": train_metrics,
-            "val": val_metrics,
-        }
-        append_jsonl(metrics_path, row)
-        print(
-            f"[epoch {epoch:03d}] loss={train_loss:.4f} "
-            f"val_mae={val_metrics['mae']:.4f} "
-            f"val_top1={val_metrics['top1_match']:.3f} "
-            f"val_top3={val_metrics['topk_recall']:.3f} "
-            f"val_ndcg5={val_metrics.get('ndcg_at_5', 0.0):.3f} "
-            f"val_regret5={val_metrics.get('top5_regret', 0.0):.3f} "
-            f"val_bad3={val_metrics.get('bad_top3_rate', 0.0):.3f} "
-            f"val_no_tool_fp={val_metrics['no_tool_fp_rate']:.3f}"
-        )
-        update_best_checkpoints(
-            states=best_states,
-            row=row,
-            model=model,
-            pairs=val_pairs,
-            run_dir=run_dir,
-            device=device,
-            primary_objective=primary_objective,
-        )
-
-    torch.save(model.state_dict(), run_dir / "last.pt")
-    write_predictions(run_dir / "val_predictions.jsonl", model, val_pairs, device)
-    write_json(run_dir / "report.json", build_report(best_states, primary_objective=primary_objective))
-    print(f"[done] run_dir={run_dir}")
-
 
 def encode_examples(examples: list[PairExample], encoder: Any, config: dict[str, Any]) -> EncodedPairs:
     batch_size = int(config["encoder"].get("batch_size", 64))
@@ -395,6 +231,68 @@ def train_one_epoch(
     return float(sum(losses) / max(1, len(losses)))
 
 
+def evaluate_saved_checkpoints(
+    *,
+    model: PairMLPRegressor | LateInteractionRegressor | FieldInteractionRegressor,
+    checkpoint_dir: Path,
+    train_pairs: EncodedPairs | EncodedSequencePairs | EncodedFieldSequencePairs,
+    val_pairs: EncodedPairs | EncodedSequencePairs | EncodedFieldSequencePairs,
+    config: dict[str, Any],
+    run_dir: Path,
+    device: torch.device,
+    include_train_metrics: bool = True,
+) -> None:
+    primary_objective = str(config["train"].get("checkpoint_objective", "composite"))
+    best_states = init_best_states(primary_objective)
+    metrics_path = run_dir / "metrics.jsonl"
+    if metrics_path.exists():
+        metrics_path.unlink()
+
+    checkpoint_paths = sorted(checkpoint_dir.glob("epoch_*.pt"))
+    if not checkpoint_paths:
+        raise RuntimeError(f"no checkpoints found in {checkpoint_dir}")
+
+    train_losses = _read_train_losses(run_dir / "train_log.jsonl")
+    best_checkpoint_paths: dict[str, Path] = {}
+    for checkpoint_path in checkpoint_paths:
+        epoch = _epoch_from_checkpoint_path(checkpoint_path)
+        state_dict = torch.load(checkpoint_path, map_location=device)
+        model.load_state_dict(state_dict)
+        train_metrics = evaluate(model, train_pairs, config, device) if include_train_metrics else {}
+        val_metrics = evaluate(model, val_pairs, config, device)
+        row = {
+            "epoch": epoch,
+            "train_loss": train_losses.get(epoch),
+            "checkpoint": str(checkpoint_path),
+            "train": train_metrics,
+            "val": val_metrics,
+        }
+        append_jsonl(metrics_path, row)
+        print(
+            f"[eval epoch {epoch:03d}] "
+            f"val_mae={val_metrics['mae']:.4f} "
+            f"val_top1={val_metrics['top1_match']:.3f} "
+            f"val_top3={val_metrics['topk_recall']:.3f} "
+            f"val_ndcg5={val_metrics.get('ndcg_at_5', 0.0):.3f} "
+            f"val_regret5={val_metrics.get('top5_regret', 0.0):.3f} "
+            f"val_bad3={val_metrics.get('bad_top3_rate', 0.0):.3f}"
+        )
+        changed = update_best_states(states=best_states, row=row)
+        for name in changed:
+            best_checkpoint_paths[name] = checkpoint_path
+
+    materialize_best_checkpoints(
+        model=model,
+        states=best_states,
+        checkpoint_paths=best_checkpoint_paths,
+        pairs=val_pairs,
+        run_dir=run_dir,
+        device=device,
+        primary_objective=primary_objective,
+    )
+    write_json(run_dir / "report.json", build_report(best_states, primary_objective=primary_objective))
+
+
 def init_best_states(primary_objective: str) -> dict[str, dict[str, Any]]:
     objectives = {
         "legacy_score": {"direction": "max"},
@@ -415,6 +313,45 @@ def init_best_states(primary_objective: str) -> dict[str, dict[str, Any]]:
     }
 
 
+def update_best_states(
+    *,
+    states: dict[str, dict[str, Any]],
+    row: dict[str, Any],
+) -> list[str]:
+    scores = checkpoint_scores(row["val"])
+    changed = []
+    for name, score in scores.items():
+        state = states[name]
+        if _is_better(score, current=state["score"], direction=str(state["direction"])):
+            state["score"] = score
+            state["row"] = row
+            changed.append(name)
+    return changed
+
+
+def materialize_best_checkpoints(
+    *,
+    model: PairMLPRegressor | LateInteractionRegressor | FieldInteractionRegressor,
+    states: dict[str, dict[str, Any]],
+    checkpoint_paths: dict[str, Path],
+    pairs: EncodedPairs | EncodedSequencePairs | EncodedFieldSequencePairs,
+    run_dir: Path,
+    device: torch.device,
+    primary_objective: str,
+) -> None:
+    for name in states:
+        checkpoint_path = checkpoint_paths.get(name)
+        if checkpoint_path is None:
+            continue
+        state_dict = torch.load(checkpoint_path, map_location=device)
+        model.load_state_dict(state_dict)
+        torch.save(model.state_dict(), run_dir / f"best_by_{name}.pt")
+        write_predictions(run_dir / f"best_by_{name}_val_predictions.jsonl", model, pairs, device)
+        if name == primary_objective:
+            torch.save(model.state_dict(), run_dir / "best.pt")
+            write_predictions(run_dir / "best_val_predictions.jsonl", model, pairs, device)
+
+
 def update_best_checkpoints(
     *,
     states: dict[str, dict[str, Any]],
@@ -425,17 +362,13 @@ def update_best_checkpoints(
     device: torch.device,
     primary_objective: str,
 ) -> None:
-    scores = checkpoint_scores(row["val"])
-    for name, score in scores.items():
-        state = states[name]
-        if _is_better(score, current=state["score"], direction=str(state["direction"])):
-            state["score"] = score
-            state["row"] = row
-            torch.save(model.state_dict(), run_dir / f"best_by_{name}.pt")
-            write_predictions(run_dir / f"best_by_{name}_val_predictions.jsonl", model, pairs, device)
-            if name == primary_objective:
-                torch.save(model.state_dict(), run_dir / "best.pt")
-                write_predictions(run_dir / "best_val_predictions.jsonl", model, pairs, device)
+    changed = update_best_states(states=states, row=row)
+    for name in changed:
+        torch.save(model.state_dict(), run_dir / f"best_by_{name}.pt")
+        write_predictions(run_dir / f"best_by_{name}_val_predictions.jsonl", model, pairs, device)
+        if name == primary_objective:
+            torch.save(model.state_dict(), run_dir / "best.pt")
+            write_predictions(run_dir / "best_val_predictions.jsonl", model, pairs, device)
 
 
 def checkpoint_scores(metrics: dict[str, float]) -> dict[str, float]:
@@ -493,6 +426,22 @@ def _is_better(score: float, *, current: float | None, direction: str) -> bool:
     if direction == "min":
         return score < current
     raise ValueError(f"unknown objective direction: {direction}")
+
+
+def _read_train_losses(path: Path) -> dict[int, float]:
+    if not path.exists():
+        return {}
+    losses: dict[int, float] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        row = json.loads(line)
+        losses[int(row["epoch"])] = float(row["train_loss"])
+    return losses
+
+
+def _epoch_from_checkpoint_path(path: Path) -> int:
+    return int(path.stem.rsplit("_", 1)[1])
 
 
 def predict_batch(
@@ -584,18 +533,25 @@ def predict_all(
             )
         return torch.cat(outputs, dim=0)
     if isinstance(pairs, EncodedSequencePairs):
-        lexical_features = (
-            torch.from_numpy(pairs.lexical_features).to(device)
-            if pairs.lexical_features is not None
-            else None
-        )
-        return model(
-            torch.from_numpy(pairs.conv_sequences).to(device),
-            torch.from_numpy(pairs.conv_masks).to(device),
-            torch.from_numpy(pairs.tool_sequences).to(device),
-            torch.from_numpy(pairs.tool_masks).to(device),
-            lexical_features,
-        )
+        outputs = []
+        batch_size = 256
+        for start in range(0, len(pairs.labels), batch_size):
+            end = min(start + batch_size, len(pairs.labels))
+            lexical_features = (
+                torch.from_numpy(pairs.lexical_features[start:end]).to(device)
+                if pairs.lexical_features is not None
+                else None
+            )
+            outputs.append(
+                model(
+                    torch.from_numpy(pairs.conv_sequences[start:end]).to(device),
+                    torch.from_numpy(pairs.conv_masks[start:end]).to(device),
+                    torch.from_numpy(pairs.tool_sequences[start:end]).to(device),
+                    torch.from_numpy(pairs.tool_masks[start:end]).to(device),
+                    lexical_features,
+                )
+            )
+        return torch.cat(outputs, dim=0)
     return model(torch.from_numpy(pairs.features).to(device))
 
 
@@ -682,7 +638,3 @@ def set_seed(seed: int) -> None:
 
 def _default_field_names() -> list[str]:
     return ["identity", "description", "capabilities", "examples", "schema"]
-
-
-if __name__ == "__main__":
-    main()

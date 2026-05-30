@@ -230,10 +230,10 @@ This version exists as the no-download fallback and sanity-check baseline.
 
 ### 5.2 V2: Frozen Jina Sequence Late Interaction
 
-Config:
+Historical config:
 
 ```text
-experiments/tool_rerank_baseline/config_jina_sequence_v2.toml
+removed single-split V2 sequence config
 ```
 
 Encoder:
@@ -319,10 +319,10 @@ semantic feature space. It was too conservative and lost ranking quality.
 
 ### 5.5 V2.2b: Lighter Gated Lexical Add
 
-Config:
+Historical config:
 
 ```text
-experiments/tool_rerank_baseline/config_jina_sequence_lexical_gated_v22b.toml
+removed single-split V2.2b gated lexical config
 ```
 
 Same fusion as V2.2, lighter lexical dropout:
@@ -420,10 +420,10 @@ Main observations:
 - V2.3 has the best Spearman, but its top1 drop makes it less attractive as the
   default router baseline.
 
-Current recommended V2 baseline:
+Current recommended CV baseline:
 
 ```text
-experiments/tool_rerank_baseline/config_jina_sequence_lexical_gated_v22b.toml
+experiments/tool_rerank_baseline/config_jina_sequence_lexical_gated_v22b_cv.toml
 ```
 
 ## 8. Failure Modes
@@ -575,14 +575,15 @@ part can remain small.
 
 ## 12. Current Recommendation
 
-Use V2.2b as the early baseline to compare future changes:
+This report is a historical snapshot from the single-split phase. That training
+mode is now deprecated; current model training must use grouped 5-fold CV.
 
 ```bash
-uv run python experiments/tool_rerank_baseline/train.py \
-  --config experiments/tool_rerank_baseline/config_jina_sequence_lexical_gated_v22b.toml
+uv run python experiments/tool_rerank_baseline/cross_validate.py \
+  --config experiments/tool_rerank_baseline/config_jina_sequence_lexical_gated_v22b_cv.toml
 ```
 
-Then run two immediate research tasks:
+Immediate research tasks should be evaluated through the CV entrypoint:
 
 1. MLP vs linear head ablation on V2.1 and V2.2b.
 2. V3 field-level tool encoding prototype.

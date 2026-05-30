@@ -7,6 +7,7 @@ import shutil
 import sys
 import tomllib
 from copy import deepcopy
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -17,20 +18,23 @@ from torch.utils.data import DataLoader
 if str(Path(__file__).parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).parent))
 
-from data import ConversationGroup, bundle_from_groups, load_all_groups
-from metrics import append_jsonl, compute_metrics, write_json
-from model import LateInteractionRegressor, build_lexical_features, build_sequence_encoder
-from train import (
-    build_report,
+from data import ConversationGroup, PairExample, bundle_from_groups, load_all_groups
+from metrics import append_jsonl, write_json
+from model import EncodedSequencePairs, LateInteractionRegressor, build_lexical_features, build_sequence_encoder
+from training_core import (
     build_tensor_dataset,
     encode_sequence_examples,
-    init_best_states,
-    predict_all,
+    evaluate_saved_checkpoints,
     set_seed,
     train_one_epoch,
-    update_best_checkpoints,
-    write_predictions,
 )
+
+
+@dataclass(frozen=True)
+class SharedCvEncoding:
+    pairs: EncodedSequencePairs
+    index_by_key: dict[tuple[str, str], int]
+    hidden_size: int
 
 
 def main() -> None:
@@ -59,6 +63,10 @@ def main() -> None:
     )
 
     device = torch.device(base_config["train"].get("device", "cpu"))
+    shared_encoding = build_shared_cv_encoding(
+        config=base_config,
+        groups=base_train + cv_groups,
+    )
     fold_reports = []
     for fold_index, fold_val in enumerate(folds, start=1):
         fold_train = base_train + [group for i, fold in enumerate(folds, start=1) if i != fold_index for group in fold]
@@ -78,6 +86,7 @@ def main() -> None:
         else:
             report = run_fold(
                 config=fold_config,
+                shared_encoding=shared_encoding,
                 train_groups=fold_train,
                 val_groups=fold_val,
                 run_dir=fold_dir,
@@ -107,18 +116,13 @@ def main() -> None:
 def run_fold(
     *,
     config: dict[str, Any],
+    shared_encoding: SharedCvEncoding,
     train_groups: list[ConversationGroup],
     val_groups: list[ConversationGroup],
     run_dir: Path,
     device: torch.device,
 ) -> dict[str, Any]:
     bundle = bundle_from_groups(train_groups=train_groups, val_groups=val_groups)
-    fit_texts = sorted(
-        {example.conversation_text for example in bundle.train_examples}
-        | {example.tool_text for example in bundle.train_examples}
-    )
-    encoder = build_sequence_encoder(config)
-    encoder.fit(fit_texts)
     lexical_builder = build_lexical_features(config)
     lexical_dim = 0
     if lexical_builder is not None:
@@ -127,24 +131,20 @@ def run_fold(
             sorted({example.tool_text for example in bundle.train_examples}),
         )
         lexical_dim = lexical_builder.feature_dim
+        print(f"[{run_dir.name}] lexical feature_dim={lexical_dim}")
 
-    split_prefix = f"cv_fold_{run_dir.name}"
-    train_pairs = encode_sequence_examples(
+    train_pairs = subset_shared_pairs(
+        shared_encoding,
         bundle.train_examples,
-        encoder,
-        config,
-        split_name=f"{split_prefix}_train",
         lexical_builder=lexical_builder,
     )
-    val_pairs = encode_sequence_examples(
+    val_pairs = subset_shared_pairs(
+        shared_encoding,
         bundle.val_examples,
-        encoder,
-        config,
-        split_name=f"{split_prefix}_val",
         lexical_builder=lexical_builder,
     )
     model = LateInteractionRegressor(
-        hidden_size=train_pairs.conv_sequences.shape[-1],
+        hidden_size=shared_encoding.hidden_size,
         lexical_dim=lexical_dim,
         lexical_fusion=str(config.get("lexical", {}).get("fusion", "concat")),
         lexical_dropout=float(config.get("lexical", {}).get("dropout", 0.0)),
@@ -163,11 +163,16 @@ def run_fold(
         shuffle=True,
     )
 
+    train_log_path = run_dir / "train_log.jsonl"
     metrics_path = run_dir / "metrics.jsonl"
-    if metrics_path.exists():
-        metrics_path.unlink()
-    primary_objective = str(config["train"].get("checkpoint_objective", "composite"))
-    best_states = init_best_states(primary_objective)
+    checkpoint_dir = run_dir / "checkpoints"
+    for path in (train_log_path, metrics_path):
+        if path.exists():
+            path.unlink()
+    if checkpoint_dir.exists():
+        shutil.rmtree(checkpoint_dir)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
     for epoch in range(1, int(config["train"].get("epochs", 30)) + 1):
         train_loss = train_one_epoch(
             model=model,
@@ -177,32 +182,100 @@ def run_fold(
             config=config,
             device=device,
         )
-        train_metrics = _evaluate_predictions(train_pairs, predict_all(model, train_pairs, device), config)
-        val_metrics = _evaluate_predictions(val_pairs, predict_all(model, val_pairs, device), config)
-        row = {"epoch": epoch, "train_loss": train_loss, "train": train_metrics, "val": val_metrics}
-        append_jsonl(metrics_path, row)
-        print(
-            f"[{run_dir.name} epoch {epoch:03d}] loss={train_loss:.4f} "
-            f"val_mae={val_metrics['mae']:.4f} val_top1={val_metrics['top1_match']:.3f} "
-            f"val_top3={val_metrics['topk_recall']:.3f} "
-            f"val_ndcg5={val_metrics.get('ndcg_at_5', 0.0):.3f} "
-            f"val_regret5={val_metrics.get('top5_regret', 0.0):.3f}"
+        checkpoint_path = checkpoint_dir / f"epoch_{epoch:03d}.pt"
+        torch.save(model.state_dict(), checkpoint_path)
+        append_jsonl(
+            train_log_path,
+            {
+                "epoch": epoch,
+                "train_loss": train_loss,
+                "checkpoint": str(checkpoint_path),
+            },
         )
-        update_best_checkpoints(
-            states=best_states,
-            row=row,
-            model=model,
-            pairs=val_pairs,
-            run_dir=run_dir,
-            device=device,
-            primary_objective=primary_objective,
-        )
+        print(f"[{run_dir.name} epoch {epoch:03d}] loss={train_loss:.4f} checkpoint={checkpoint_path}")
 
     torch.save(model.state_dict(), run_dir / "last.pt")
-    write_predictions(run_dir / "val_predictions.jsonl", model, val_pairs, device)
-    report = build_report(best_states, primary_objective=primary_objective)
-    write_json(run_dir / "report.json", report)
-    return report
+    evaluate_saved_checkpoints(
+        model=model,
+        checkpoint_dir=checkpoint_dir,
+        train_pairs=train_pairs,
+        val_pairs=val_pairs,
+        config=config,
+        run_dir=run_dir,
+        device=device,
+        include_train_metrics=False,
+    )
+    return json.loads((run_dir / "report.json").read_text(encoding="utf-8"))
+
+
+def build_shared_cv_encoding(
+    *,
+    config: dict[str, Any],
+    groups: list[ConversationGroup],
+) -> SharedCvEncoding:
+    model_kind = config.get("model", {}).get("kind", "sequence_late_interaction")
+    if model_kind != "sequence_late_interaction":
+        raise ValueError(f"cross_validate.py currently supports sequence_late_interaction, got {model_kind}")
+
+    bundle = bundle_from_groups(train_groups=groups, val_groups=[])
+    examples = bundle.train_examples
+    fit_texts = sorted({example.conversation_text for example in examples} | {example.tool_text for example in examples})
+    print(
+        f"[shared] groups={len(groups)} pairs={len(examples)} "
+        f"unique_conversations={len({e.conversation_id for e in examples})} "
+        f"unique_tools={len({e.tool_id for e in examples})}"
+    )
+    encoder = build_sequence_encoder(config)
+    encoder.fit(fit_texts)
+    pairs = encode_sequence_examples(
+        examples,
+        encoder,
+        config,
+        split_name="cv_shared",
+        lexical_builder=None,
+    )
+    index_by_key = {}
+    for index, example in enumerate(examples):
+        key = (example.conversation_id, example.tool_id)
+        if key in index_by_key:
+            raise ValueError(f"duplicate pair in shared CV encoding: {key}")
+        index_by_key[key] = index
+    print(f"[shared] encoded pair tensor shape={pairs.conv_sequences.shape}")
+    return SharedCvEncoding(
+        pairs=pairs,
+        index_by_key=index_by_key,
+        hidden_size=int(pairs.conv_sequences.shape[-1]),
+    )
+
+
+def subset_shared_pairs(
+    shared_encoding: SharedCvEncoding,
+    examples: list[PairExample],
+    *,
+    lexical_builder: Any,
+) -> EncodedSequencePairs:
+    indices = np.asarray(
+        [shared_encoding.index_by_key[(example.conversation_id, example.tool_id)] for example in examples],
+        dtype=np.int64,
+    )
+    pairs = shared_encoding.pairs
+    lexical_features = None
+    if lexical_builder is not None:
+        lexical_features = lexical_builder.transform(
+            [example.conversation_text for example in examples],
+            [example.tool_text for example in examples],
+        )
+    return EncodedSequencePairs(
+        conv_sequences=pairs.conv_sequences[indices],
+        conv_masks=pairs.conv_masks[indices],
+        tool_sequences=pairs.tool_sequences[indices],
+        tool_masks=pairs.tool_masks[indices],
+        lexical_features=lexical_features,
+        labels=pairs.labels[indices],
+        conversation_ids=[pairs.conversation_ids[index] for index in indices],
+        tool_ids=[pairs.tool_ids[index] for index in indices],
+        raw_scores=pairs.raw_scores[indices],
+    )
 
 
 def split_for_cv(
@@ -267,19 +340,6 @@ def aggregate_reports(reports: list[dict[str, Any]]) -> dict[str, Any]:
             "max": float(values.max()),
         }
     return aggregate
-
-
-def _evaluate_predictions(pairs: Any, predictions: torch.Tensor, config: dict[str, Any]) -> dict[str, float]:
-    eval_cfg = config["eval"]
-    return compute_metrics(
-        labels=pairs.labels,
-        predictions=predictions.detach().cpu().numpy(),
-        conversation_ids=pairs.conversation_ids,
-        tool_ids=pairs.tool_ids,
-        high_label_threshold=float(eval_cfg.get("high_label_threshold", 0.8)),
-        high_pred_threshold=float(eval_cfg.get("high_pred_threshold", 0.8)),
-        topk=int(eval_cfg.get("topk", 3)),
-    )
 
 
 if __name__ == "__main__":
