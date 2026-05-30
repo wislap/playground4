@@ -25,6 +25,7 @@ from model import (
     PairMLPRegressor,
     build_pair_features,
 )
+from policy_features import PolicyFeatureBuilder
 
 def encode_examples(examples: list[PairExample], encoder: Any, config: dict[str, Any]) -> EncodedPairs:
     batch_size = int(config["encoder"].get("batch_size", 64))
@@ -46,6 +47,7 @@ def encode_sequence_examples(
     *,
     split_name: str,
     lexical_builder: LexicalFeatureBuilder | None = None,
+    policy_builder: PolicyFeatureBuilder | None = None,
 ) -> EncodedSequencePairs:
     batch_size = int(config["encoder"].get("batch_size", 8))
     unique_conversations = sorted({example.conversation_id: example.conversation_text for example in examples}.items())
@@ -70,6 +72,13 @@ def encode_sequence_examples(
             [example.conversation_text for example in examples],
             [example.tool_text for example in examples],
         )
+    if policy_builder is not None:
+        policy_features = policy_builder.transform(examples)
+        lexical_features = (
+            policy_features
+            if lexical_features is None
+            else np.concatenate([lexical_features, policy_features], axis=1).astype("float32")
+        )
     conv_indices = np.asarray([conv_index[example.conversation_id] for example in examples], dtype=np.int64)
     tool_indices = np.asarray([tool_index[example.tool_id] for example in examples], dtype=np.int64)
     return EncodedSequencePairs(
@@ -93,6 +102,7 @@ def encode_field_sequence_examples(
     split_name: str,
     field_names: list[str],
     lexical_builder: LexicalFeatureBuilder | None = None,
+    policy_builder: PolicyFeatureBuilder | None = None,
 ) -> EncodedFieldSequencePairs:
     batch_size = int(config["encoder"].get("batch_size", 8))
     unique_conversations = sorted({example.conversation_id: example.conversation_text for example in examples}.items())
@@ -122,6 +132,13 @@ def encode_field_sequence_examples(
         lexical_features = lexical_builder.transform(
             [example.conversation_text for example in examples],
             [example.tool_text for example in examples],
+        )
+    if policy_builder is not None:
+        policy_features = policy_builder.transform(examples)
+        lexical_features = (
+            policy_features
+            if lexical_features is None
+            else np.concatenate([lexical_features, policy_features], axis=1).astype("float32")
         )
     conv_indices = np.asarray([conv_index[example.conversation_id] for example in examples], dtype=np.int64)
     tool_indices = np.asarray([tool_index[example.tool_id] for example in examples], dtype=np.int64)

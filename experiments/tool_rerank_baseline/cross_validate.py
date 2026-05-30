@@ -21,6 +21,7 @@ if str(Path(__file__).parent) not in sys.path:
 from data import ConversationGroup, PairExample, bundle_from_groups, load_all_groups
 from metrics import append_jsonl, write_json
 from model import EncodedSequencePairs, LateInteractionRegressor, build_lexical_features, build_sequence_encoder
+from policy_features import PolicyFeatureBuilder, build_policy_features
 from training_core import (
     build_tensor_dataset,
     encode_sequence_examples,
@@ -124,6 +125,7 @@ def run_fold(
 ) -> dict[str, Any]:
     bundle = bundle_from_groups(train_groups=train_groups, val_groups=val_groups)
     lexical_builder = build_lexical_features(config)
+    policy_builder = build_policy_features(config)
     lexical_dim = 0
     if lexical_builder is not None:
         lexical_builder.fit(
@@ -132,16 +134,21 @@ def run_fold(
         )
         lexical_dim = lexical_builder.feature_dim
         print(f"[{run_dir.name}] lexical feature_dim={lexical_dim}")
+    if policy_builder is not None:
+        lexical_dim += policy_builder.feature_dim
+        print(f"[{run_dir.name}] policy feature_dim={policy_builder.feature_dim}")
 
     train_pairs = subset_shared_pairs(
         shared_encoding,
         bundle.train_examples,
         lexical_builder=lexical_builder,
+        policy_builder=policy_builder,
     )
     val_pairs = subset_shared_pairs(
         shared_encoding,
         bundle.val_examples,
         lexical_builder=lexical_builder,
+        policy_builder=policy_builder,
     )
     model = LateInteractionRegressor(
         hidden_size=shared_encoding.hidden_size,
@@ -259,6 +266,7 @@ def subset_shared_pairs(
     examples: list[PairExample],
     *,
     lexical_builder: Any,
+    policy_builder: PolicyFeatureBuilder | None,
 ) -> EncodedSequencePairs:
     indices = np.asarray(
         [shared_encoding.index_by_key[(example.conversation_id, example.tool_id)] for example in examples],
@@ -270,6 +278,13 @@ def subset_shared_pairs(
         lexical_features = lexical_builder.transform(
             [example.conversation_text for example in examples],
             [example.tool_text for example in examples],
+        )
+    if policy_builder is not None:
+        policy_features = policy_builder.transform(examples)
+        lexical_features = (
+            policy_features
+            if lexical_features is None
+            else np.concatenate([lexical_features, policy_features], axis=1).astype("float32")
         )
     return EncodedSequencePairs(
         conv_sequences=pairs.conv_sequences[indices],
