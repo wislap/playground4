@@ -70,11 +70,13 @@ def encode_sequence_examples(
             [example.conversation_text for example in examples],
             [example.tool_text for example in examples],
         )
+    conv_indices = np.asarray([conv_index[example.conversation_id] for example in examples], dtype=np.int64)
+    tool_indices = np.asarray([tool_index[example.tool_id] for example in examples], dtype=np.int64)
     return EncodedSequencePairs(
-        conv_sequences=np.asarray([conv_seq[conv_index[e.conversation_id]] for e in examples], dtype="float32"),
-        conv_masks=np.asarray([conv_mask[conv_index[e.conversation_id]] for e in examples], dtype="bool"),
-        tool_sequences=np.asarray([tool_seq[tool_index[e.tool_id]] for e in examples], dtype="float32"),
-        tool_masks=np.asarray([tool_mask[tool_index[e.tool_id]] for e in examples], dtype="bool"),
+        conv_sequences=np.asarray(conv_seq[conv_indices], dtype="float32"),
+        conv_masks=np.asarray(conv_mask[conv_indices], dtype="bool"),
+        tool_sequences=np.asarray(tool_seq[tool_indices], dtype="float32"),
+        tool_masks=np.asarray(tool_mask[tool_indices], dtype="bool"),
         lexical_features=lexical_features,
         labels=np.asarray([example.label for example in examples], dtype="float32"),
         conversation_ids=[example.conversation_id for example in examples],
@@ -121,22 +123,18 @@ def encode_field_sequence_examples(
             [example.conversation_text for example in examples],
             [example.tool_text for example in examples],
         )
+    conv_indices = np.asarray([conv_index[example.conversation_id] for example in examples], dtype=np.int64)
+    tool_indices = np.asarray([tool_index[example.tool_id] for example in examples], dtype=np.int64)
     return EncodedFieldSequencePairs(
         field_names=field_names,
-        conv_sequences=np.asarray([conv_seq[conv_index[e.conversation_id]] for e in examples], dtype="float32"),
-        conv_masks=np.asarray([conv_mask[conv_index[e.conversation_id]] for e in examples], dtype="bool"),
+        conv_sequences=np.asarray(conv_seq[conv_indices], dtype="float32"),
+        conv_masks=np.asarray(conv_mask[conv_indices], dtype="bool"),
         field_sequences={
-            field_name: np.asarray(
-                [field_sequences[field_name][tool_index[e.tool_id]] for e in examples],
-                dtype="float32",
-            )
+            field_name: np.asarray(field_sequences[field_name][tool_indices], dtype="float32")
             for field_name in field_names
         },
         field_masks={
-            field_name: np.asarray(
-                [field_masks[field_name][tool_index[e.tool_id]] for e in examples],
-                dtype="bool",
-            )
+            field_name: np.asarray(field_masks[field_name][tool_indices], dtype="bool")
             for field_name in field_names
         },
         lexical_features=lexical_features,
@@ -195,40 +193,147 @@ def train_one_epoch(
     full_train: EncodedPairs | EncodedSequencePairs | EncodedFieldSequencePairs,
     config: dict[str, Any],
     device: torch.device,
-) -> float:
+) -> dict[str, float]:
     model.train()
-    losses: list[float] = []
+    component_sums: dict[str, float] = {}
+    component_counts: dict[str, int] = {}
     criterion = torch.nn.SmoothL1Loss()
     grad_accum_steps = max(1, int(config["train"].get("grad_accum_steps", 1)))
+    loss_cfg = config.get("loss", {})
+    pointwise_weight = float(loss_cfg.get("pointwise_weight", 1.0))
     optimizer.zero_grad()
     for step, batch in enumerate(loader, start=1):
         predictions, labels = predict_batch(model, batch, device)
-        loss = criterion(predictions, labels)
+        pointwise_loss = criterion(predictions, labels)
+        loss = pointwise_weight * pointwise_loss
         (loss / grad_accum_steps).backward()
         if step % grad_accum_steps == 0:
             optimizer.step()
             optimizer.zero_grad()
-        losses.append(float(loss.detach().cpu()))
+        _accumulate_loss(component_sums, component_counts, "pointwise_loss", pointwise_loss)
+        _accumulate_loss(component_sums, component_counts, "pointwise_weighted_loss", loss)
     if len(loader) % grad_accum_steps != 0:
         optimizer.step()
         optimizer.zero_grad()
 
     pairwise_weight = float(config["train"].get("pairwise_weight", 0.0))
-    if pairwise_weight > 0:
-        # One lightweight full-set ranking step per epoch; simple and easy to inspect.
+    ranking_weights = {
+        "pairwise": pairwise_weight,
+        "listnet": float(loss_cfg.get("listnet_weight", 0.0)),
+        "lambda_ndcg": float(loss_cfg.get("lambda_ndcg_weight", 0.0)),
+        "bad_exposure": float(loss_cfg.get("bad_exposure_weight", 0.0)),
+        "no_tool_fp": float(loss_cfg.get("no_tool_fp_weight", 0.0)),
+        "score_spread": float(loss_cfg.get("score_spread_weight", 0.0)),
+    }
+    if any(weight > 0 for weight in ranking_weights.values()):
         labels = torch.from_numpy(full_train.labels).to(device)
         predictions = predict_all(model, full_train, device)
-        rank_loss = pairwise_margin_loss(
-            predictions=predictions,
-            labels=labels,
-            conversation_ids=full_train.conversation_ids,
-            margin=float(config["train"].get("pairwise_margin", 0.1)),
-        )
+        ranking_loss = predictions.sum() * 0.0
+        if ranking_weights["pairwise"] > 0:
+            component = pairwise_margin_loss(
+                predictions=predictions,
+                labels=labels,
+                conversation_ids=full_train.conversation_ids,
+                margin=float(config["train"].get("pairwise_margin", 0.1)),
+            )
+            ranking_loss = ranking_loss + ranking_weights["pairwise"] * component
+            _accumulate_loss(component_sums, component_counts, "pairwise_loss", component)
+            _accumulate_loss(
+                component_sums,
+                component_counts,
+                "pairwise_weighted_loss",
+                ranking_weights["pairwise"] * component,
+            )
+        if ranking_weights["listnet"] > 0:
+            component = listnet_loss(
+                predictions=predictions,
+                labels=labels,
+                conversation_ids=full_train.conversation_ids,
+                temperature=float(loss_cfg.get("listnet_temperature", 0.7)),
+                min_label_gap=float(loss_cfg.get("listnet_min_label_gap", 0.05)),
+            )
+            ranking_loss = ranking_loss + ranking_weights["listnet"] * component
+            _accumulate_loss(component_sums, component_counts, "listnet_loss", component)
+            _accumulate_loss(
+                component_sums,
+                component_counts,
+                "listnet_weighted_loss",
+                ranking_weights["listnet"] * component,
+            )
+        if ranking_weights["lambda_ndcg"] > 0:
+            component = lambda_ndcg_loss(
+                predictions=predictions,
+                labels=labels,
+                conversation_ids=full_train.conversation_ids,
+                topk=int(loss_cfg.get("lambda_ndcg_topk", 5)),
+                sigma=float(loss_cfg.get("lambda_ndcg_sigma", 1.0)),
+                min_label_gap=float(loss_cfg.get("lambda_ndcg_min_label_gap", 0.05)),
+            )
+            ranking_loss = ranking_loss + ranking_weights["lambda_ndcg"] * component
+            _accumulate_loss(component_sums, component_counts, "lambda_ndcg_loss", component)
+            _accumulate_loss(
+                component_sums,
+                component_counts,
+                "lambda_ndcg_weighted_loss",
+                ranking_weights["lambda_ndcg"] * component,
+            )
+        if ranking_weights["bad_exposure"] > 0:
+            component = bad_exposure_loss(
+                predictions=predictions,
+                labels=labels,
+                bad_label_threshold=float(loss_cfg.get("bad_label_threshold", -1.0)),
+                bad_score_margin=float(loss_cfg.get("bad_score_margin", 0.0)),
+            )
+            ranking_loss = ranking_loss + ranking_weights["bad_exposure"] * component
+            _accumulate_loss(component_sums, component_counts, "bad_exposure_loss", component)
+            _accumulate_loss(
+                component_sums,
+                component_counts,
+                "bad_exposure_weighted_loss",
+                ranking_weights["bad_exposure"] * component,
+            )
+        if ranking_weights["no_tool_fp"] > 0:
+            component = no_tool_false_positive_loss(
+                predictions=predictions,
+                labels=labels,
+                conversation_ids=full_train.conversation_ids,
+                high_label_threshold=float(loss_cfg.get("high_label_threshold", 1.0)),
+                high_score_threshold=float(loss_cfg.get("high_score_threshold", 1.0)),
+            )
+            ranking_loss = ranking_loss + ranking_weights["no_tool_fp"] * component
+            _accumulate_loss(component_sums, component_counts, "no_tool_fp_loss", component)
+            _accumulate_loss(
+                component_sums,
+                component_counts,
+                "no_tool_fp_weighted_loss",
+                ranking_weights["no_tool_fp"] * component,
+            )
+        if ranking_weights["score_spread"] > 0:
+            component = score_spread_loss(
+                predictions=predictions,
+                labels=labels,
+                conversation_ids=full_train.conversation_ids,
+                target_std=float(loss_cfg.get("score_spread_target_std", 0.7)),
+            )
+            ranking_loss = ranking_loss + ranking_weights["score_spread"] * component
+            _accumulate_loss(component_sums, component_counts, "score_spread_loss", component)
+            _accumulate_loss(
+                component_sums,
+                component_counts,
+                "score_spread_weighted_loss",
+                ranking_weights["score_spread"] * component,
+            )
         optimizer.zero_grad()
-        (pairwise_weight * rank_loss).backward()
+        ranking_loss.backward()
         optimizer.step()
-        losses.append(float(rank_loss.detach().cpu()))
-    return float(sum(losses) / max(1, len(losses)))
+        _accumulate_loss(component_sums, component_counts, "ranking_weighted_loss", ranking_loss)
+
+    metrics = {
+        name: value / max(1, component_counts[name])
+        for name, value in sorted(component_sums.items())
+    }
+    metrics["train_loss"] = metrics.get("pointwise_weighted_loss", 0.0) + metrics.get("ranking_weighted_loss", 0.0)
+    return metrics
 
 
 def evaluate_saved_checkpoints(
@@ -291,6 +396,16 @@ def evaluate_saved_checkpoints(
         primary_objective=primary_objective,
     )
     write_json(run_dir / "report.json", build_report(best_states, primary_objective=primary_objective))
+
+
+def _accumulate_loss(
+    sums: dict[str, float],
+    counts: dict[str, int],
+    name: str,
+    value: torch.Tensor,
+) -> None:
+    sums[name] = sums.get(name, 0.0) + float(value.detach().cpu())
+    counts[name] = counts.get(name, 0) + 1
 
 
 def init_best_states(primary_objective: str) -> dict[str, dict[str, Any]]:
@@ -580,6 +695,162 @@ def pairwise_margin_loss(
     if not losses:
         return predictions.sum() * 0.0
     return torch.stack(losses).mean()
+
+
+def listnet_loss(
+    *,
+    predictions: torch.Tensor,
+    labels: torch.Tensor,
+    conversation_ids: list[str],
+    temperature: float,
+    min_label_gap: float,
+) -> torch.Tensor:
+    losses: list[torch.Tensor] = []
+    by_group: dict[str, list[int]] = {}
+    for index, conversation_id in enumerate(conversation_ids):
+        by_group.setdefault(conversation_id, []).append(index)
+    temperature = max(temperature, 1e-4)
+    for indices in by_group.values():
+        if len(indices) < 2:
+            continue
+        idx = torch.tensor(indices, device=predictions.device)
+        group_predictions = predictions[idx]
+        group_labels = labels[idx]
+        if float(group_labels.max() - group_labels.min()) < min_label_gap:
+            continue
+        target = torch.softmax(group_labels / temperature, dim=0)
+        log_probs = torch.log_softmax(group_predictions / temperature, dim=0)
+        losses.append(-(target * log_probs).sum())
+    if not losses:
+        return predictions.sum() * 0.0
+    return torch.stack(losses).mean()
+
+
+def lambda_ndcg_loss(
+    *,
+    predictions: torch.Tensor,
+    labels: torch.Tensor,
+    conversation_ids: list[str],
+    topk: int,
+    sigma: float,
+    min_label_gap: float,
+) -> torch.Tensor:
+    losses: list[torch.Tensor] = []
+    by_group = _group_indices(conversation_ids)
+    sigma = max(sigma, 1e-4)
+    for indices in by_group.values():
+        if len(indices) < 2:
+            continue
+        idx = torch.tensor(indices, device=predictions.device)
+        group_predictions = predictions[idx]
+        group_labels = labels[idx]
+        if float(group_labels.max() - group_labels.min()) < min_label_gap:
+            continue
+        ranks = _prediction_ranks(group_predictions)
+        gains = _label_gains(group_labels)
+        discounts = _rank_discounts(ranks, topk=topk)
+        ideal_dcg = _ideal_dcg(gains, topk=topk).clamp_min(1e-6)
+
+        label_diff = group_labels.unsqueeze(1) - group_labels.unsqueeze(0)
+        ordered_pair_mask = label_diff > min_label_gap
+        if not bool(ordered_pair_mask.any()):
+            continue
+        pred_diff = group_predictions.unsqueeze(1) - group_predictions.unsqueeze(0)
+        gain_diff = torch.abs(gains.unsqueeze(1) - gains.unsqueeze(0))
+        discount_diff = torch.abs(discounts.unsqueeze(1) - discounts.unsqueeze(0))
+        delta_ndcg = gain_diff * discount_diff / ideal_dcg
+        pair_loss = torch.nn.functional.softplus(-sigma * pred_diff) / sigma
+        losses.append((delta_ndcg[ordered_pair_mask] * pair_loss[ordered_pair_mask]).mean())
+    if not losses:
+        return predictions.sum() * 0.0
+    return torch.stack(losses).mean()
+
+
+def bad_exposure_loss(
+    *,
+    predictions: torch.Tensor,
+    labels: torch.Tensor,
+    bad_label_threshold: float,
+    bad_score_margin: float,
+) -> torch.Tensor:
+    bad_mask = labels <= bad_label_threshold
+    if not bool(bad_mask.any()):
+        return predictions.sum() * 0.0
+    return torch.nn.functional.softplus(predictions[bad_mask] - bad_score_margin).mean()
+
+
+def no_tool_false_positive_loss(
+    *,
+    predictions: torch.Tensor,
+    labels: torch.Tensor,
+    conversation_ids: list[str],
+    high_label_threshold: float,
+    high_score_threshold: float,
+) -> torch.Tensor:
+    losses: list[torch.Tensor] = []
+    for indices in _group_indices(conversation_ids).values():
+        idx = torch.tensor(indices, device=predictions.device)
+        group_labels = labels[idx]
+        if float(group_labels.max()) >= high_label_threshold:
+            continue
+        group_predictions = predictions[idx]
+        losses.append(torch.nn.functional.softplus(group_predictions.max() - high_score_threshold))
+    if not losses:
+        return predictions.sum() * 0.0
+    return torch.stack(losses).mean()
+
+
+def score_spread_loss(
+    *,
+    predictions: torch.Tensor,
+    labels: torch.Tensor,
+    conversation_ids: list[str],
+    target_std: float,
+) -> torch.Tensor:
+    losses: list[torch.Tensor] = []
+    for indices in _group_indices(conversation_ids).values():
+        if len(indices) < 2:
+            continue
+        idx = torch.tensor(indices, device=predictions.device)
+        group_labels = labels[idx]
+        if float(group_labels.max() - group_labels.min()) < 0.05:
+            continue
+        group_predictions = predictions[idx]
+        losses.append(torch.relu(target_std - group_predictions.std(unbiased=False)))
+    if not losses:
+        return predictions.sum() * 0.0
+    return torch.stack(losses).mean()
+
+
+def _group_indices(conversation_ids: list[str]) -> dict[str, list[int]]:
+    by_group: dict[str, list[int]] = {}
+    for index, conversation_id in enumerate(conversation_ids):
+        by_group.setdefault(conversation_id, []).append(index)
+    return by_group
+
+
+def _prediction_ranks(group_predictions: torch.Tensor) -> torch.Tensor:
+    order = torch.argsort(group_predictions, descending=True)
+    ranks = torch.empty_like(order)
+    ranks[order] = torch.arange(1, len(order) + 1, device=group_predictions.device)
+    return ranks.float()
+
+
+def _label_gains(group_labels: torch.Tensor) -> torch.Tensor:
+    shifted = group_labels - group_labels.min()
+    return torch.clamp(shifted, min=0.0)
+
+
+def _rank_discounts(ranks: torch.Tensor, *, topk: int) -> torch.Tensor:
+    discounts = 1.0 / torch.log2(ranks + 1.0)
+    return torch.where(ranks <= topk, discounts, torch.zeros_like(discounts))
+
+
+def _ideal_dcg(gains: torch.Tensor, *, topk: int) -> torch.Tensor:
+    k = min(topk, len(gains))
+    ideal_gains = torch.sort(gains, descending=True).values[:k]
+    discounts = 1.0 / torch.log2(torch.arange(2, k + 2, device=gains.device, dtype=gains.dtype))
+    return torch.sum(ideal_gains * discounts)
 
 
 @torch.no_grad()

@@ -47,6 +47,24 @@ pairwise_weight = 0.2
 pairwise_margin = 0.1
 device = "cpu"
 
+[loss]
+pointwise_weight = 1.0
+listnet_weight = 0.0
+listnet_temperature = 0.7
+listnet_min_label_gap = 0.05
+lambda_ndcg_weight = 0.0
+lambda_ndcg_topk = 5
+lambda_ndcg_sigma = 1.0
+lambda_ndcg_min_label_gap = 0.05
+bad_exposure_weight = 0.0
+bad_label_threshold = -1.0
+bad_score_margin = 0.0
+no_tool_fp_weight = 0.0
+high_label_threshold = 1.0
+high_score_threshold = 1.0
+score_spread_weight = 0.0
+score_spread_target_std = 0.7
+
 [eval]
 high_label_threshold = 1.0
 high_pred_threshold = 1.0

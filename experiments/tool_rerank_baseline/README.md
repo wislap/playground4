@@ -41,6 +41,22 @@ uv run python experiments/tool_rerank_baseline/cross_validate.py \
   --config experiments/tool_rerank_baseline/config_jina_sequence_lexical_gated_v22b_cv_gpu.toml
 ```
 
+Loss-function CV variants:
+
+```bash
+# Listwise soft target ranking.
+uv run python experiments/tool_rerank_baseline/cross_validate.py \
+  --config experiments/tool_rerank_baseline/config_jina_sequence_lexical_gated_v22b_cv_listnet_gpu.toml
+
+# LambdaNDCG@5 ranking with a calibration anchor.
+uv run python experiments/tool_rerank_baseline/cross_validate.py \
+  --config experiments/tool_rerank_baseline/config_jina_sequence_lexical_gated_v22b_cv_lambda_gpu.toml
+
+# LambdaNDCG@5 plus bad-tool/no-tool risk penalties and spread regularization.
+uv run python experiments/tool_rerank_baseline/cross_validate.py \
+  --config experiments/tool_rerank_baseline/config_jina_sequence_lexical_gated_v22b_cv_risk_gpu.toml
+```
+
 Analyze a finished fold or run directory:
 
 ```bash

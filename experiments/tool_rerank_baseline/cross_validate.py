@@ -174,7 +174,7 @@ def run_fold(
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     for epoch in range(1, int(config["train"].get("epochs", 30)) + 1):
-        train_loss = train_one_epoch(
+        train_metrics = train_one_epoch(
             model=model,
             optimizer=optimizer,
             loader=train_loader,
@@ -188,11 +188,17 @@ def run_fold(
             train_log_path,
             {
                 "epoch": epoch,
-                "train_loss": train_loss,
                 "checkpoint": str(checkpoint_path),
+                **train_metrics,
             },
         )
-        print(f"[{run_dir.name} epoch {epoch:03d}] loss={train_loss:.4f} checkpoint={checkpoint_path}")
+        print(
+            f"[{run_dir.name} epoch {epoch:03d}] "
+            f"loss={train_metrics['train_loss']:.4f} "
+            f"point={train_metrics.get('pointwise_weighted_loss', 0.0):.4f} "
+            f"rank={train_metrics.get('ranking_weighted_loss', 0.0):.4f} "
+            f"checkpoint={checkpoint_path}"
+        )
 
     torch.save(model.state_dict(), run_dir / "last.pt")
     evaluate_saved_checkpoints(
