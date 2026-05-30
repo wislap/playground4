@@ -18,11 +18,13 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--run-dir", type=Path, required=True)
+    parser.add_argument("--predictions", type=Path)
     args = parser.parse_args()
     config = tomllib.loads(args.config.read_text(encoding="utf-8"))
+    predictions_path = args.predictions or _default_predictions_path(args.run_dir)
     rows = [
         json.loads(line)
-        for line in (args.run_dir / "val_predictions.jsonl").open(encoding="utf-8")
+        for line in predictions_path.open(encoding="utf-8")
         if line.strip()
     ]
     metrics = compute_metrics(
@@ -36,6 +38,13 @@ def main() -> None:
     )
     write_json(args.run_dir / "metrics_recomputed.json", metrics)
     print(json.dumps(metrics, indent=2, sort_keys=True))
+
+
+def _default_predictions_path(run_dir: Path) -> Path:
+    best_path = run_dir / "best_val_predictions.jsonl"
+    if best_path.exists():
+        return best_path
+    return run_dir / "val_predictions.jsonl"
 
 
 if __name__ == "__main__":

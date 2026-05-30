@@ -140,8 +140,8 @@ def main() -> None:
         shuffle=True,
     )
 
-    best_score = -1.0
-    best_report: dict[str, Any] = {}
+    primary_objective = str(config["train"].get("checkpoint_objective", "composite"))
+    best_states = init_best_states(primary_objective)
     metrics_path = run_dir / "metrics.jsonl"
     if metrics_path.exists():
         metrics_path.unlink()
@@ -174,16 +174,19 @@ def main() -> None:
             f"val_bad3={val_metrics.get('bad_top3_rate', 0.0):.3f} "
             f"val_no_tool_fp={val_metrics['no_tool_fp_rate']:.3f}"
         )
-        score = val_metrics["topk_recall"] - val_metrics["no_tool_fp_rate"] - val_metrics["mae"]
-        if score > best_score:
-            best_score = score
-            best_report = row
-            torch.save(model.state_dict(), run_dir / "best.pt")
-            write_predictions(run_dir / "best_val_predictions.jsonl", model, val_pairs, device)
+        update_best_checkpoints(
+            states=best_states,
+            row=row,
+            model=model,
+            pairs=val_pairs,
+            run_dir=run_dir,
+            device=device,
+            primary_objective=primary_objective,
+        )
 
     torch.save(model.state_dict(), run_dir / "last.pt")
     write_predictions(run_dir / "val_predictions.jsonl", model, val_pairs, device)
-    write_json(run_dir / "report.json", {"best_score": best_score, "best": best_report})
+    write_json(run_dir / "report.json", build_report(best_states, primary_objective=primary_objective))
     print(f"[done] run_dir={run_dir}")
 
 
@@ -392,6 +395,106 @@ def train_one_epoch(
     return float(sum(losses) / max(1, len(losses)))
 
 
+def init_best_states(primary_objective: str) -> dict[str, dict[str, Any]]:
+    objectives = {
+        "legacy_score": {"direction": "max"},
+        "composite": {"direction": "max"},
+        "ndcg_at_5": {"direction": "max"},
+        "top5_regret": {"direction": "min"},
+        "safety": {"direction": "max"},
+    }
+    if primary_objective not in objectives:
+        raise ValueError(f"unknown checkpoint_objective: {primary_objective}")
+    return {
+        name: {
+            "direction": spec["direction"],
+            "score": None,
+            "row": {},
+        }
+        for name, spec in objectives.items()
+    }
+
+
+def update_best_checkpoints(
+    *,
+    states: dict[str, dict[str, Any]],
+    row: dict[str, Any],
+    model: PairMLPRegressor | LateInteractionRegressor | FieldInteractionRegressor,
+    pairs: EncodedPairs | EncodedSequencePairs | EncodedFieldSequencePairs,
+    run_dir: Path,
+    device: torch.device,
+    primary_objective: str,
+) -> None:
+    scores = checkpoint_scores(row["val"])
+    for name, score in scores.items():
+        state = states[name]
+        if _is_better(score, current=state["score"], direction=str(state["direction"])):
+            state["score"] = score
+            state["row"] = row
+            torch.save(model.state_dict(), run_dir / f"best_by_{name}.pt")
+            write_predictions(run_dir / f"best_by_{name}_val_predictions.jsonl", model, pairs, device)
+            if name == primary_objective:
+                torch.save(model.state_dict(), run_dir / "best.pt")
+                write_predictions(run_dir / "best_val_predictions.jsonl", model, pairs, device)
+
+
+def checkpoint_scores(metrics: dict[str, float]) -> dict[str, float]:
+    legacy = metrics["topk_recall"] - metrics["no_tool_fp_rate"] - metrics["mae"]
+    composite = (
+        0.35 * metrics.get("ndcg_at_5", 0.0)
+        + 0.25 * metrics["topk_recall"]
+        + 0.20 * metrics.get("high_value_recall_at_5", 0.0)
+        - 0.20 * metrics.get("top5_regret", 0.0)
+        - 0.20 * metrics.get("bad_top3_rate", 0.0)
+        - 0.10 * metrics["mae"]
+    )
+    safety = (
+        0.35 * metrics.get("high_conf_precision", 0.0)
+        + 0.25 * (1.0 - metrics.get("bad_top3_rate", 0.0))
+        + 0.20 * (1.0 - metrics.get("bad_top5_rate", 0.0))
+        + 0.20 * (1.0 - metrics["no_tool_fp_rate"])
+    )
+    return {
+        "legacy_score": float(legacy),
+        "composite": float(composite),
+        "ndcg_at_5": float(metrics.get("ndcg_at_5", 0.0)),
+        "top5_regret": float(metrics.get("top5_regret", 0.0)),
+        "safety": float(safety),
+    }
+
+
+def build_report(
+    states: dict[str, dict[str, Any]],
+    *,
+    primary_objective: str,
+) -> dict[str, Any]:
+    best_by = {
+        name: {
+            "score": state["score"],
+            "direction": state["direction"],
+            "row": state["row"],
+        }
+        for name, state in states.items()
+    }
+    primary = best_by[primary_objective]
+    return {
+        "checkpoint_objective": primary_objective,
+        "best_score": primary["score"],
+        "best": primary["row"],
+        "best_by": best_by,
+    }
+
+
+def _is_better(score: float, *, current: float | None, direction: str) -> bool:
+    if current is None:
+        return True
+    if direction == "max":
+        return score > current
+    if direction == "min":
+        return score < current
+    raise ValueError(f"unknown objective direction: {direction}")
+
+
 def predict_batch(
     model: PairMLPRegressor | LateInteractionRegressor | FieldInteractionRegressor,
     batch: tuple[torch.Tensor, ...],
@@ -410,8 +513,8 @@ def predict_batch(
                 tool_mask.to(device),
                 lexical_features.to(device),
             ),
-        labels.to(device),
-    )
+            labels.to(device),
+        )
     if isinstance(model, FieldInteractionRegressor):
         conv_seq = batch[0]
         conv_mask = batch[1]

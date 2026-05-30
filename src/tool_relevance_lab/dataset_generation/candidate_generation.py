@@ -23,6 +23,7 @@ class CandidateGenerationTask:
     sample_id: str
     conversation: ConversationRecord
     seed: int
+    record: CandidateSetRecord | None = None
 
 
 def build_candidate_tasks(
@@ -49,24 +50,16 @@ async def generate_candidate_sets(
     config: CandidateGenerationConfig,
 ) -> ResumableRunSummary:
     conversations = read_model_jsonl(conversations_path, ConversationRecord)
-    tasks = build_candidate_tasks(conversations, seed=config.seed)
-    sampler = CandidateSampler(
-        universe,
-        CandidateSamplingConfig(
-            plugin_sample_rate=config.plugin_sample_rate,
-            target_force_rate=config.target_force_rate,
-            weight_decay_on_select=config.weight_decay_on_select,
-            shuffle_candidates=True,
-        ),
+    tasks = _materialize_candidate_tasks(
+        universe=universe,
+        conversations=conversations,
+        config=config,
     )
 
     async def worker(task: CandidateGenerationTask) -> CandidateSetRecord:
-        return sampler.sample(
-            sample_id=task.sample_id,
-            conversation_id=task.conversation.conversation_id,
-            seed=task.seed,
-            target_tool_ids=task.conversation.generation_hint.target_tool_ids,
-        )
+        if task.record is None:
+            raise RuntimeError(f"candidate task was not materialized: {task.sample_id}")
+        return task.record
 
     return await run_resumable_jobs(
         items=tasks,
@@ -79,3 +72,38 @@ async def generate_candidate_sets(
         max_attempts=1,
         progress_label="candidate_sets",
     )
+
+
+def _materialize_candidate_tasks(
+    *,
+    universe: ToolUniverse,
+    conversations: list[ConversationRecord],
+    config: CandidateGenerationConfig,
+) -> list[CandidateGenerationTask]:
+    sampler = CandidateSampler(
+        universe,
+        CandidateSamplingConfig(
+            plugin_sample_rate=config.plugin_sample_rate,
+            target_force_rate=config.target_force_rate,
+            weight_decay_on_select=config.weight_decay_on_select,
+            shuffle_candidates=True,
+        ),
+    )
+    tasks = build_candidate_tasks(conversations, seed=config.seed)
+    materialized: list[CandidateGenerationTask] = []
+    for task in tasks:
+        record = sampler.sample(
+            sample_id=task.sample_id,
+            conversation_id=task.conversation.conversation_id,
+            seed=task.seed,
+            target_tool_ids=task.conversation.generation_hint.target_tool_ids,
+        )
+        materialized.append(
+            CandidateGenerationTask(
+                sample_id=task.sample_id,
+                conversation=task.conversation,
+                seed=task.seed,
+                record=record,
+            )
+        )
+    return materialized

@@ -21,11 +21,14 @@ from data import ConversationGroup, bundle_from_groups, load_all_groups
 from metrics import append_jsonl, compute_metrics, write_json
 from model import LateInteractionRegressor, build_lexical_features, build_sequence_encoder
 from train import (
+    build_report,
     build_tensor_dataset,
     encode_sequence_examples,
+    init_best_states,
     predict_all,
     set_seed,
     train_one_epoch,
+    update_best_checkpoints,
     write_predictions,
 )
 
@@ -163,8 +166,8 @@ def run_fold(
     metrics_path = run_dir / "metrics.jsonl"
     if metrics_path.exists():
         metrics_path.unlink()
-    best_score = -1.0
-    best_report: dict[str, Any] = {}
+    primary_objective = str(config["train"].get("checkpoint_objective", "composite"))
+    best_states = init_best_states(primary_objective)
     for epoch in range(1, int(config["train"].get("epochs", 30)) + 1):
         train_loss = train_one_epoch(
             model=model,
@@ -185,15 +188,19 @@ def run_fold(
             f"val_ndcg5={val_metrics.get('ndcg_at_5', 0.0):.3f} "
             f"val_regret5={val_metrics.get('top5_regret', 0.0):.3f}"
         )
-        score = val_metrics["topk_recall"] - val_metrics["no_tool_fp_rate"] - val_metrics["mae"]
-        if score > best_score:
-            best_score = score
-            best_report = row
-            torch.save(model.state_dict(), run_dir / "best.pt")
+        update_best_checkpoints(
+            states=best_states,
+            row=row,
+            model=model,
+            pairs=val_pairs,
+            run_dir=run_dir,
+            device=device,
+            primary_objective=primary_objective,
+        )
 
     torch.save(model.state_dict(), run_dir / "last.pt")
     write_predictions(run_dir / "val_predictions.jsonl", model, val_pairs, device)
-    report = {"best_score": best_score, "best": best_report}
+    report = build_report(best_states, primary_objective=primary_objective)
     write_json(run_dir / "report.json", report)
     return report
 
@@ -233,6 +240,20 @@ def aggregate_reports(reports: list[dict[str, Any]]) -> dict[str, Any]:
         "spearman",
         "top1_match",
         "topk_recall",
+        "top1_regret",
+        "top3_regret",
+        "top5_regret",
+        "ndcg_at_3",
+        "ndcg_at_5",
+        "bad_top3_rate",
+        "bad_top5_rate",
+        "agent_bad_top3_rate",
+        "top3_label_mean",
+        "top5_label_mean",
+        "top3_label_max",
+        "top5_label_max",
+        "high_value_recall_at_3",
+        "high_value_recall_at_5",
         "no_tool_fp_rate",
         "high_conf_precision",
     ]

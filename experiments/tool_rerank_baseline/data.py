@@ -58,7 +58,7 @@ def load_all_groups(config: dict[str, Any]) -> list[ConversationGroup]:
     run_dir = REPO_ROOT / data_cfg["run_dir"]
     tools = load_tool_universes(
         [REPO_ROOT / path for path in data_cfg["tool_universe_paths"]],
-        tool_universe_id="runtime_tool_pool_v4",
+        tool_universe_id=data_cfg.get("tool_universe_id"),
     ).by_id()
 
     conversations = {

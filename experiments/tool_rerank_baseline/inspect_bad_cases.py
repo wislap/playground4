@@ -19,13 +19,15 @@ def main() -> None:
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--predictions", type=Path)
     parser.add_argument("--limit", type=int, default=12)
     args = parser.parse_args()
 
     config = tomllib.loads(args.config.read_text(encoding="utf-8"))
     bundle = load_dataset(config)
     examples = {(_key(example)): example for example in bundle.val_examples}
-    predictions = [json.loads(line) for line in (args.run_dir / "val_predictions.jsonl").open(encoding="utf-8")]
+    predictions_path = args.predictions or _default_predictions_path(args.run_dir)
+    predictions = [json.loads(line) for line in predictions_path.open(encoding="utf-8")]
     for row in predictions:
         row["example"] = examples[(row["conversation_id"], row["tool_id"])]
 
@@ -83,6 +85,7 @@ def main() -> None:
     args.out.write_text(
         render_report(
             run_dir=args.run_dir,
+            predictions_path=predictions_path,
             top1_misses=top1_misses[: args.limit],
             false_positives=false_positives[: args.limit],
             false_negatives=false_negatives[: args.limit],
@@ -95,6 +98,7 @@ def main() -> None:
 def render_report(
     *,
     run_dir: Path,
+    predictions_path: Path,
     top1_misses: list[dict[str, Any]],
     false_positives: list[dict[str, Any]],
     false_negatives: list[dict[str, Any]],
@@ -103,6 +107,7 @@ def render_report(
         "# Bad Case Inspection",
         "",
         f"Run: `{run_dir}`",
+        f"Predictions: `{predictions_path}`",
         "",
         "## Top1 Ranking Misses",
         "",
@@ -192,6 +197,13 @@ def fenced(text: str) -> str:
 
 def _key(example: PairExample) -> tuple[str, str]:
     return example.conversation_id, example.tool_id
+
+
+def _default_predictions_path(run_dir: Path) -> Path:
+    best_path = run_dir / "best_val_predictions.jsonl"
+    if best_path.exists():
+        return best_path
+    return run_dir / "val_predictions.jsonl"
 
 
 if __name__ == "__main__":
