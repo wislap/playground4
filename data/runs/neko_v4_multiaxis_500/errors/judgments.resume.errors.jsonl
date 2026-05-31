@@ -1,0 +1,2 @@
+{"attempt": 3, "error_message": "judgment scores mismatch for sample_id=sample_000298; missing=['plugin.douyin_live_monitor']; extra=[]", "error_type": "ValueError", "item_id": "sample_000298", "timestamp": 1780213761.279709}
+{"attempt": 3, "error_message": "judgment scores mismatch for sample_id=sample_000339; missing=['plugin.tea_ceremony_companion']; extra=[]", "error_type": "ValueError", "item_id": "sample_000339", "timestamp": 1780214114.3057852}

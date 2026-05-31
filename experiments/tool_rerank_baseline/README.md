@@ -2,6 +2,13 @@
 
 Research-first baseline for N.E.K.O tool relevance training.
 
+Latest V4.1 notes:
+
+- `V4_1_HYBRID_CALIBRATION_REPORT.md` records the V4 calibration cleanup and
+  the two-MLP factorized CV result.
+- Active V4.1 config:
+  `config_jina_sequence_v41_two_mlp_hybrid_cv_gpu.toml`.
+
 Current training policy: all model training must go through grouped 5-fold
 cross-validation. Single split training, repeated seed runners, parallel ad-hoc
 runners, ridge sweeps, and non-CV training configs have been removed to keep

@@ -1,0 +1,10 @@
+{
+  "completed_existing": 28,
+  "error_path": "data/runs/neko_v4_multiaxis_500/errors/judgments.resume.errors.jsonl",
+  "failed": 2,
+  "output_path": "data/runs/neko_v4_multiaxis_500/judgments.jsonl",
+  "skipped": 28,
+  "submitted": 472,
+  "succeeded": 470,
+  "total": 500
+}

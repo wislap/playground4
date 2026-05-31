@@ -144,6 +144,12 @@ def build_multiaxis_judge_prompt(
         f"{render_conversation(task.conversation)}\n\n"
         "Visible candidate tools in shuffled system order:\n"
         f"{render_tool_list(universe, candidate_ids)}\n\n"
+        "Coverage requirement:\n"
+        f"- You must output exactly {len(candidate_ids)} score objects, one for each candidate tool ID.\n"
+        "- Do not omit any candidate, including the final candidate in the list.\n"
+        "- If a candidate is irrelevant, still output all seven axes with low or appropriate scores.\n"
+        "- The scores array must cover these IDs exactly, in this order:\n"
+        f"{json.dumps(candidate_ids, ensure_ascii=False)}\n\n"
         "Score every candidate on every axis from 0 to 100. Axis definitions:\n"
         "1. capability_match: If the user truly wanted the relevant task done, can this tool perform it? "
         "Ignore user intent, permission, risk, and tone.\n"
@@ -277,9 +283,16 @@ def calibrate_multiaxis_confidences(
     judgments: list[MultiAxisJudgmentRecord],
     *,
     clip_percentile: float = 0.001,
+    final_absolute_threshold: float = 10.0,
+    final_relative_full_threshold: float = 60.0,
+    final_relative_weight: float = 0.35,
 ) -> list[CalibratedMultiAxisToolScore]:
     if not 0.0 <= clip_percentile < 0.5:
         raise ValueError("clip_percentile must be in [0, 0.5)")
+    if final_relative_full_threshold <= final_absolute_threshold:
+        raise ValueError("final_relative_full_threshold must be greater than final_absolute_threshold")
+    if not 0.0 <= final_relative_weight <= 1.0:
+        raise ValueError("final_relative_weight must be in [0, 1]")
 
     aggregated = aggregate_multiaxis_judgments(judgments)
     raw_by_key_axis = {(sample_id, tool_id, axis): values for (sample_id, tool_id, axis), values in aggregated.items()}
@@ -287,6 +300,14 @@ def calibrate_multiaxis_confidences(
     calibrated_by_axis: dict[ScoreAxis, dict[tuple[str, str], tuple[float, float, float]]] = {}
     for axis in AXES:
         calibrated_by_axis[axis] = _calibrate_axis(raw_by_key_axis, axis=axis, clip_percentile=clip_percentile)
+    calibrated_by_axis["final_preference"] = _calibrate_final_preference(
+        raw_by_key_axis,
+        relative_calibrated=calibrated_by_axis["final_preference"],
+        clip_percentile=clip_percentile,
+        absolute_threshold=final_absolute_threshold,
+        relative_full_threshold=final_relative_full_threshold,
+        relative_weight=final_relative_weight,
+    )
 
     rows = []
     for sample_id, tool_id in sample_tool_keys:
@@ -358,6 +379,56 @@ def _calibrate_axis(
     return {
         (sample_id, tool_id): (raw, z_value, score, disagreement)
         for (sample_id, tool_id, raw, z_value, disagreement), score in zip(local_rows, calibrated, strict=True)
+    }
+
+
+def _calibrate_final_preference(
+    raw_by_key_axis: dict[tuple[str, str, ScoreAxis], list[float]],
+    *,
+    relative_calibrated: dict[tuple[str, str], tuple[float, float, float, float]],
+    clip_percentile: float,
+    absolute_threshold: float,
+    relative_full_threshold: float,
+    relative_weight: float,
+) -> dict[tuple[str, str], tuple[float, float, float, float]]:
+    by_sample: dict[str, list[tuple[str, float, float]]] = defaultdict(list)
+    for (sample_id, tool_id, axis), values in raw_by_key_axis.items():
+        if axis != "final_preference":
+            continue
+        raw = float(statistics.median(values))
+        disagreement = float(max(values) - min(values))
+        by_sample[sample_id].append((tool_id, raw, disagreement))
+
+    normal = NormalDist()
+    hybrid_rows: list[tuple[str, str, float, float, float, float]] = []
+    for sample_id, rows in by_sample.items():
+        group_max = max(raw for _, raw, _ in rows)
+        if group_max <= absolute_threshold:
+            relative_mix = 0.0
+        else:
+            ramp = (group_max - absolute_threshold) / (relative_full_threshold - absolute_threshold)
+            relative_mix = relative_weight * min(1.0, max(0.0, ramp))
+        raw_scores = [raw for _, raw, _ in rows]
+        mean = statistics.fmean(raw_scores)
+        std = statistics.pstdev(raw_scores)
+        for tool_id, raw, disagreement in rows:
+            percentile = (min(100.0, max(0.0, raw)) + 0.5) / 101.0
+            percentile = min(max(percentile, clip_percentile), 1.0 - clip_percentile)
+            absolute_score = normal.inv_cdf(percentile)
+            relative_score = relative_calibrated[(sample_id, tool_id)][2]
+            hybrid_score = ((1.0 - relative_mix) * absolute_score) + (relative_mix * relative_score)
+            local_z = 0.0 if std == 0.0 else (raw - mean) / std
+            # Tiny deterministic tie-breaker prevents huge raw-score plateaus from collapsing to
+            # a single calibrated value while preserving the absolute-strength ordering.
+            tie_breaker = (relative_score * 1.0e-6) + (len(hybrid_rows) * 1.0e-12)
+            hybrid_rows.append((sample_id, tool_id, raw, local_z, disagreement, hybrid_score + tie_breaker))
+
+    normalized = _rank_gaussian([row[5] for row in hybrid_rows], clip_percentile=clip_percentile)
+    return {
+        (sample_id, tool_id): (raw, local_z, score, disagreement)
+        for (sample_id, tool_id, raw, local_z, disagreement, _), score in zip(
+            hybrid_rows, normalized, strict=True
+        )
     }
 
 

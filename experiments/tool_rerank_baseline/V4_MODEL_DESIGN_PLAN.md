@@ -47,15 +47,14 @@ single-label baseline.
 
 ## Dataset Assumptions
 
-Two dataset lines should be kept separate:
+V4 should keep only one active training data line: the multi-axis dataset. It
+must contain `axis_scores` and keep `confidence = axis_scores.final_preference`
+for backward compatibility.
 
-- `neko_v3e_500`: refreshed single-score LLM-B dataset. This is useful as the
-  strongest v3 single-target baseline.
-- v4 multi-axis dataset: required for the actual V4 model. It must contain
-  `axis_scores` and keep `confidence = axis_scores.final_preference` for
-  backward compatibility.
+Single-score rerun datasets must not live beside the v4 data as active training
+inputs, because they are easy to confuse with multi-axis data and will silently
+disable factor supervision.
 
-V4 experiments should not silently train on v3e as if it were multi-axis data.
 If `axis_scores` is missing, the experiment should either fail clearly or run
 only a v3-compatible baseline mode.
 
@@ -285,16 +284,7 @@ same curve, the dataset did not become orthogonal enough.
 
 Run all experiments under the existing 5-fold CV protocol.
 
-### A. V3E Final-Only Baseline
-
-Train the current v2.2b model on `neko_v3e_500`.
-
-Purpose:
-
-- establish the strongest single-label baseline after LLM-B rerun;
-- separate dataset refresh gains from architecture gains.
-
-### B. V4 Final-Only Baseline
+### A. V4 Final-Only Baseline
 
 Train v2.2b-style model on v4 data using only:
 
@@ -307,7 +297,7 @@ Purpose:
 - measure whether v4 data itself improves final labels even without factor
   heads.
 
-### C. V4 Auxiliary Factor Heads
+### B. V4 Auxiliary Factor Heads
 
 Train:
 
@@ -322,7 +312,7 @@ Purpose:
 
 - test whether factor supervision regularizes the shared representation.
 
-### D. V4 Factor-To-Final Linear Head
+### C. V4 Factor-To-Final Linear Head
 
 Train:
 
@@ -336,7 +326,7 @@ Purpose:
 - test the user's hypothesis: factors are high-order features and final
   preference can be learned by another linear layer.
 
-### E. V4 Factor Interactions
+### D. V4 Factor Interactions
 
 Train:
 
@@ -349,7 +339,7 @@ Purpose:
 - test whether final recommendation depends on non-additive relations such as:
   consent x cost, action x cost, companionship x action.
 
-### F. V4 Ranking Loss
+### E. V4 Ranking Loss
 
 Add LambdaNDCG or pairwise ranking loss on final preference.
 
@@ -357,7 +347,7 @@ Purpose:
 
 - improve top-k recommendation without losing continuous calibration.
 
-### G. V4 Consistency Penalty
+### F. V4 Consistency Penalty
 
 Add soft safety consistency.
 
@@ -399,7 +389,7 @@ PairExample.final_axis_label    -> final_preference
 
 Requirements:
 
-- old v3/v3e data still loads;
+- old single-score data still loads only in explicit baseline mode;
 - v4 mode fails clearly if `axis_scores` is missing;
 - axis order is fixed and centralized.
 
@@ -455,7 +445,7 @@ Write a V4 early report after A-D at minimum.
 
 The report should answer:
 
-- Does v4 data improve over v3e single labels?
+- Does v4 final-only establish a stable baseline on the same multi-axis data?
 - Do factor heads regularize the model?
 - Can factor predictions linearly explain final preference?
 - Which slices improve or degrade?

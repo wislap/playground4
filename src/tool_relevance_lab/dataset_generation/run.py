@@ -74,6 +74,9 @@ def main() -> None:
     calibrate_multiaxis_parser.add_argument("--judgments", "--judgements", dest="judgments", type=Path, required=True)
     calibrate_multiaxis_parser.add_argument("--output", type=Path, required=True)
     calibrate_multiaxis_parser.add_argument("--clip-percentile", type=float, default=0.001)
+    calibrate_multiaxis_parser.add_argument("--final-absolute-threshold", type=float, default=10.0)
+    calibrate_multiaxis_parser.add_argument("--final-relative-full-threshold", type=float, default=60.0)
+    calibrate_multiaxis_parser.add_argument("--final-relative-weight", type=float, default=0.35)
 
     report_parser = subparsers.add_parser("report")
     report_parser.add_argument("--tool-universe", type=Path, action="append", required=True)
@@ -224,7 +227,13 @@ def main() -> None:
 
     if args.command == "calibrate-multiaxis":
         judgments = read_model_jsonl(args.judgments, MultiAxisJudgmentRecord)
-        scores = calibrate_multiaxis_confidences(judgments, clip_percentile=args.clip_percentile)
+        scores = calibrate_multiaxis_confidences(
+            judgments,
+            clip_percentile=args.clip_percentile,
+            final_absolute_threshold=args.final_absolute_threshold,
+            final_relative_full_threshold=args.final_relative_full_threshold,
+            final_relative_weight=args.final_relative_weight,
+        )
         write_jsonl(args.output, multiaxis_rows_to_jsonl(scores))
         return
 
