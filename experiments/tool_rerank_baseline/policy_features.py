@@ -436,27 +436,32 @@ def build_policy_features(config: dict, *, section: str = "policy_features") -> 
 
 def _conversation_features(example: PairExample) -> dict[str, float]:
     text = example.conversation_text.lower()
+    latest_user = _latest_user_or_conversation(example)
     scenario = example.scenario_type.lower()
     relevance = example.relevance_mode.lower()
+    actionability = example.latest_user_actionability.lower()
+    authorization = example.authorization_level.lower()
     features = {
         "conv_agentic_task": _score_any(scenario, [r"agentic"]) or _score_any(text, [r"帮我", r"please", r"can you", r"打开", r"处理", r"calculate", r"fill"]),
         "conv_companion": _score_any(scenario + " " + relevance, [r"companion", r"no_tool"]) or _score_any(text, [r"陪", r"聊", r"吐槽"]),
         "conv_boundary": _score_any(scenario + " " + relevance, [r"boundary", r"refusal"]) or _score_any(text, REFUSAL_PATTERNS),
         "conv_proactive": _score_any(scenario + " " + relevance, [r"proactive", r"followup"]),
         "conv_open_thread": _score_any(scenario + " " + relevance, [r"open_thread"]),
-        "conv_actionable": _score_any(text, [r"帮我", r"please", r"can you", r"处理", r"计算", r"打开", r"填", r"生成", r"整理"]),
-        "conv_authorized": _score_any(text, [r"帮我", r"please", r"can you", r"直接", r"按我说的", r"我授权"]),
-        "conv_refusal": _score_any(text, REFUSAL_PATTERNS),
-        "conv_no_tool": _score_any(text, [r"不要.*工具", r"别.*帮", r"不用.*帮", r"不要.*变成", r"no tool", r"no need"]),
+        "conv_actionable": (1.0 if actionability == "actionable" else 0.0)
+        or _score_any(latest_user, [r"帮我", r"please", r"can you", r"处理", r"计算", r"打开", r"填", r"生成", r"整理", r"要", r"yes"]),
+        "conv_authorized": (1.0 if authorization in {"explicit", "implied"} and actionability == "actionable" else 0.0)
+        or _score_any(latest_user, [r"帮我", r"please", r"can you", r"直接", r"按我说的", r"我授权", r"actually yes", r"\byes\b", r"要"]),
+        "conv_refusal": _score_any(latest_user, REFUSAL_PATTERNS),
+        "conv_no_tool": _score_any(latest_user, [r"不要.*工具", r"别.*帮", r"不用.*帮", r"不要.*变成", r"no tool", r"no need", r"just chat"]),
         "conv_no_reminder": _score_any(text, [r"别.*提醒", r"不要.*提醒", r"不用.*提醒", r"no reminder"]),
         "conv_no_upload": _score_any(text, [r"别.*上传", r"不要.*上传", r"don't upload", r"do not upload"]),
-        "conv_no_monitoring": _score_any(text, [r"别.*监听", r"不要.*监听", r"不想.*监听", r"别.*监控", r"monitoring"]),
-        "conv_no_search": _score_any(text, [r"别.*搜", r"不要.*搜", r"别.*查", r"不要.*查", r"don't search"]),
+        "conv_no_monitoring": _score_any(latest_user, [r"别.*监听", r"不要.*监听", r"不想.*监听", r"别.*监控", r"monitoring"]),
+        "conv_no_search": _score_any(latest_user, [r"别.*搜", r"不要.*搜", r"别.*查", r"不要.*查", r"不查", r"don't search"]),
         "conv_no_file": _score_any(text, [r"别.*文件", r"不要.*文件", r"别.*索引", r"不要.*索引", r"file"]),
         "conv_no_planning": _score_any(text, [r"别.*规划", r"不要.*规划", r"别.*行程", r"不要.*行程", r"itinerary"]),
-        "conv_no_control": _score_any(text, [r"别.*控制", r"不要.*控制", r"不要管", r"don't control"]),
-        "conv_just_venting": _score_any(text, JUST_VENTING_PATTERNS),
-        "conv_quiet_presence": _score_any(text, QUIET_PATTERNS),
+        "conv_no_control": _score_any(latest_user, [r"别.*控制", r"不要.*控制", r"不要管", r"don't control"]),
+        "conv_just_venting": _score_any(latest_user, JUST_VENTING_PATTERNS),
+        "conv_quiet_presence": _score_any(latest_user, QUIET_PATTERNS),
     }
     return {name: float(value) for name, value in features.items()}
 
@@ -526,8 +531,11 @@ def _action_consent_features(
     tool: dict[str, float],
 ) -> dict[str, float]:
     text = example.conversation_text.lower()
+    latest_user = _latest_user_or_conversation(example)
     scenario = example.scenario_type.lower()
     relevance = example.relevance_mode.lower()
+    actionability = example.latest_user_actionability.lower()
+    authorization = example.authorization_level.lower()
     tool_text = f"{example.tool_id}\n{example.tool_text}".lower()
 
     no_call_intent = max(
@@ -538,17 +546,18 @@ def _action_consent_features(
     )
     ask_confirm_intent = max(
         _score_any(scenario + " " + relevance, [r"weak", r"clarification", r"ambiguous", r"suggested_tool_no_auth"]),
-        _score_any(text, [r"要不要", r"可以吗", r"先问", r"确认", r"maybe", r"should i"]),
+        _score_any(latest_user, [r"要不要", r"可以吗", r"先问", r"确认", r"maybe", r"should i"]),
     )
     can_call_intent = max(
         conv["conv_authorized"],
+        1.0 if actionability == "actionable" and authorization in {"explicit", "implied"} else 0.0,
         _score_any(scenario + " " + relevance, [r"agentic_task", r"explicit_plugin_action", r"actionable_tool"]),
     )
     explicit_refusal = max(conv["conv_refusal"], _score_any(text, REFUSAL_PATTERNS))
-    temporary_defer = _score_any(text, TEMPORARY_DEFER_PATTERNS)
+    temporary_defer = _score_any(latest_user, TEMPORARY_DEFER_PATTERNS)
 
-    denied = {name: _score_any(text, patterns) for name, patterns in DENIAL_PATTERNS.items()}
-    requested = {name: _score_any(text, patterns) for name, patterns in REQUEST_PATTERNS.items()}
+    denied = {name: _score_any(latest_user, patterns) for name, patterns in DENIAL_PATTERNS.items()}
+    requested = {name: _score_any(latest_user, patterns) for name, patterns in REQUEST_PATTERNS.items()}
 
     tool_read_only = max(tool["tool_file"], tool["tool_research"], tool["tool_study"]) * (1.0 - tool["tool_external"])
     tool_external_side_effect = max(tool["tool_external"], tool["tool_message"], tool["tool_social"])
@@ -636,8 +645,11 @@ def _action_consent_b_features(
     tool: dict[str, float],
 ) -> dict[str, float]:
     text = example.conversation_text.lower()
+    latest_user = _latest_user_or_conversation(example)
     scenario = example.scenario_type.lower()
     relevance = example.relevance_mode.lower()
+    actionability = example.latest_user_actionability.lower()
+    authorization = example.authorization_level.lower()
     tool_text = f"{example.tool_id}\n{example.tool_text}".lower()
 
     no_call_intent = max(
@@ -648,17 +660,18 @@ def _action_consent_b_features(
     )
     ask_confirm_intent = max(
         _score_any(scenario + " " + relevance, [r"weak", r"clarification", r"ambiguous", r"suggested_tool_no_auth"]),
-        _score_any(text, [r"要不要", r"可以吗", r"先问", r"确认", r"maybe", r"should i"]),
+        _score_any(latest_user, [r"要不要", r"可以吗", r"先问", r"确认", r"maybe", r"should i"]),
     )
     can_call_intent = max(
         conv["conv_authorized"],
+        1.0 if actionability == "actionable" and authorization in {"explicit", "implied"} else 0.0,
         _score_any(scenario + " " + relevance, [r"agentic_task", r"explicit_plugin_action", r"actionable_tool"]),
     )
-    temporary_defer = _score_any(text, TEMPORARY_DEFER_PATTERNS)
-    final_confirmation_required = _score_any(text, CONFIRMATION_PATTERNS)
+    temporary_defer = _score_any(latest_user, TEMPORARY_DEFER_PATTERNS)
+    final_confirmation_required = _score_any(latest_user, CONFIRMATION_PATTERNS)
 
-    requested = {name: _score_any(text, patterns) for name, patterns in OPERATION_PATTERNS.items()}
-    denied = {name: _score_any(text, patterns) for name, patterns in DENIAL_PATTERNS.items()}
+    requested = {name: _score_any(latest_user, patterns) for name, patterns in OPERATION_PATTERNS.items()}
+    denied = {name: _score_any(latest_user, patterns) for name, patterns in DENIAL_PATTERNS.items()}
 
     tool_read_or_fetch = max(
         _score_any(tool_text, OPERATION_PATTERNS["read_or_fetch"]),
@@ -758,6 +771,13 @@ def _action_consent_b_features(
         "acb_refusal_device_control_veto": refusal_device_control_veto,
     }
     return {name: float(features[name]) for name in ACTION_CONSENT_B_FEATURES}
+
+
+def _latest_user_or_conversation(example: PairExample) -> str:
+    latest_user = example.latest_user_text.strip().lower()
+    if latest_user:
+        return latest_user
+    return example.conversation_text.lower()
 
 
 def _feature_names_for_groups(groups: tuple[str, ...]) -> list[str]:
