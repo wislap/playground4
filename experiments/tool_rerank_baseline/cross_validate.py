@@ -206,6 +206,9 @@ def run_fold(
             final_head=str(config["model"].get("final_head", "linear")),
             use_factor_interactions=bool(config["model"].get("use_factor_interactions", False)),
             detach_factors_for_final=bool(config["model"].get("detach_factors_for_final", False)),
+            final_gate=bool(config["model"].get("final_gate", False)),
+            final_gate_hidden_dim=int(config["model"].get("final_gate_hidden_dim", 32)),
+            final_gate_scale=float(config["model"].get("final_gate_scale", 0.5)),
         ).to(device)
     else:
         raise ValueError(f"unknown model.kind: {model_kind}")

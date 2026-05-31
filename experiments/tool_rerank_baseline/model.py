@@ -573,11 +573,15 @@ class FactorizedLateInteractionRegressor(nn.Module):
         final_head: str = "linear",
         use_factor_interactions: bool = False,
         detach_factors_for_final: bool = False,
+        final_gate: bool = False,
+        final_gate_hidden_dim: int = 32,
+        final_gate_scale: float = 0.5,
     ) -> None:
         super().__init__()
         self.factor_count = factor_count
         self.use_factor_interactions = use_factor_interactions
         self.detach_factors_for_final = detach_factors_for_final
+        self.final_gate_scale = final_gate_scale
         self.base = LateInteractionRegressor(
             hidden_size=hidden_size,
             lexical_dim=lexical_dim,
@@ -621,6 +625,15 @@ class FactorizedLateInteractionRegressor(nn.Module):
             dropout=dropout,
             head=final_head,
         )
+        self.final_gate = (
+            _build_small_head(
+                input_dim=final_input_dim,
+                hidden_dim=final_gate_hidden_dim,
+                dropout=dropout,
+            )
+            if final_gate and final_gate_scale > 0.0
+            else None
+        )
 
     def forward(
         self,
@@ -646,7 +659,10 @@ class FactorizedLateInteractionRegressor(nn.Module):
             final_parts.append(_factor_interactions(final_factors))
         if self.final_feature_projection is not None:
             final_parts.append(self.final_feature_projection(features))
-        final = self.final_head(torch.cat(final_parts, dim=1)).squeeze(-1)
+        final_input = torch.cat(final_parts, dim=1)
+        final = self.final_head(final_input).squeeze(-1)
+        if self.final_gate is not None:
+            final = final - self.final_gate_scale * torch.sigmoid(self.final_gate(final_input).squeeze(-1))
         if policy_features is not None and self.base.policy_residual is not None:
             policy_input = self.base.policy_dropout(policy_features)
             policy_delta = self.base.policy_scale * torch.tanh(self.base.policy_residual(policy_input).squeeze(-1))
@@ -724,7 +740,29 @@ def _build_head(*, input_dim: int, hidden_dim: int, dropout: float, head: str) -
             nn.GELU(),
             nn.Linear(hidden_dim // 2, 1),
         )
+    if head == "swiglu":
+        return SwiGLUHead(input_dim=input_dim, hidden_dim=hidden_dim, dropout=dropout, expansion=2.67)
     raise ValueError(f"unknown model.head: {head}")
+
+
+class SwiGLUHead(nn.Module):
+    def __init__(self, *, input_dim: int, hidden_dim: int, dropout: float, expansion: float = 2.67) -> None:
+        super().__init__()
+        inner_dim = max(8, round(hidden_dim * expansion))
+        output_hidden_dim = max(8, hidden_dim // 2)
+        self.up_gate = nn.Linear(input_dim, inner_dim * 2)
+        self.norm = nn.LayerNorm(inner_dim)
+        self.dropout = nn.Dropout(dropout)
+        self.down = nn.Linear(inner_dim, output_hidden_dim)
+        self.out = nn.Linear(output_hidden_dim, 1)
+
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        values, gates = self.up_gate(features).chunk(2, dim=-1)
+        hidden = values * torch.nn.functional.silu(gates)
+        hidden = self.norm(hidden)
+        hidden = self.dropout(hidden)
+        hidden = torch.nn.functional.gelu(self.down(hidden))
+        return self.out(hidden)
 
 
 def _build_small_head(*, input_dim: int, hidden_dim: int, dropout: float) -> nn.Module:
