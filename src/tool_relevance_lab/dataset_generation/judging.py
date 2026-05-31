@@ -196,11 +196,6 @@ def normalize_judgment_record(
     config: JudgeGenerationConfig,
 ) -> JudgmentRecord:
     candidate_order = task.candidate_set.candidate_set.tool_ids
-    if record.candidate_tool_order != candidate_order:
-        raise ValueError(
-            "judgment candidate_tool_order must exactly match the candidate set order "
-            f"for sample_id={task.sample_id}"
-        )
     scores_by_id = {score.tool_id: score.raw_score for score in record.scores}
     missing = [tool_id for tool_id in candidate_order if tool_id not in scores_by_id]
     extra = [tool_id for tool_id in scores_by_id if tool_id not in set(candidate_order)]

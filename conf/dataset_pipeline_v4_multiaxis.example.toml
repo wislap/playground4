@@ -1,0 +1,48 @@
+[run]
+run_id = "neko_v4_multiaxis_500"
+output_root = "data"
+seed = 20260526
+max_attempts = 3
+
+[tool_universe]
+id = "runtime_tool_pool_v4"
+paths = [
+  "data/tool_universes/neko_real_v1",
+  "data/tool_universes/synthetic_plugins_v1",
+  "data/tool_universes/synthetic_plugins_v2",
+  "data/tool_universes/synthetic_plugins_v3",
+  "data/tool_universes/synthetic_plugins_v4",
+]
+
+[generation]
+count = 500
+targets_per_conversation = 1
+concurrency = 6
+
+[candidate_sampling]
+plugin_sample_rate = 0.10
+target_force_rate = 1.0
+weight_decay_on_select = 0.70
+concurrency = 1
+
+[llm.generator]
+base_url = "https://your-relay.example/v1"
+api_key = "sk-..."
+model = "your-conversation-generator-model"
+temperature = 0.9
+timeout_seconds = 120
+retries = 3
+
+[llm.judge]
+mode = "multiaxis"
+base_url = "https://your-relay.example/v1"
+api_key = "sk-..."
+model = "your-tool-judge-model"
+temperature = 0.2
+timeout_seconds = 120
+retries = 3
+concurrency = 8
+judge_run_id = "judge_multiaxis_v1"
+
+[calibration]
+clip_percentile = 0.001

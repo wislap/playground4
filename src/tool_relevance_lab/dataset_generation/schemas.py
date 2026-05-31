@@ -8,6 +8,15 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 ToolKind = Literal["agent", "plugin"]
 MessageRole = Literal["system", "user", "assistant"]
 CategorySource = Literal["manual", "heuristic", "llm", "mixed"]
+ScoreAxis = Literal[
+    "capability_match",
+    "action_demand",
+    "target_specificity",
+    "consent_boundary",
+    "intervention_cost",
+    "companionship_fit",
+    "final_preference",
+]
 
 
 class StrictModel(BaseModel):
@@ -170,6 +179,31 @@ class RawToolScore(StrictModel):
         return value
 
 
+class RawAxisScore(StrictModel):
+    axis: ScoreAxis
+    raw_score: float
+
+    @field_validator("raw_score")
+    @classmethod
+    def validate_raw_score(cls, value: float) -> float:
+        if not 0.0 <= value <= 100.0:
+            raise ValueError("raw_score must be in [0, 100]")
+        return value
+
+
+class MultiAxisToolScore(StrictModel):
+    tool_id: str
+    scores: list[RawAxisScore]
+    rationale: dict[str, str] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_unique_axes(self) -> MultiAxisToolScore:
+        axes = [score.axis for score in self.scores]
+        if len(axes) != len(set(axes)):
+            raise ValueError("axis scores must not contain duplicate axes")
+        return self
+
+
 class JudgmentRecord(StrictModel):
     sample_id: str
     conversation_id: str
@@ -189,9 +223,36 @@ class JudgmentRecord(StrictModel):
         return self
 
 
+class MultiAxisJudgmentRecord(StrictModel):
+    sample_id: str
+    conversation_id: str
+    judge_run_id: str
+    candidate_tool_order: list[str]
+    scores: list[MultiAxisToolScore]
+    provenance: Provenance = Field(default_factory=Provenance)
+
+    @model_validator(mode="after")
+    def validate_scores_match_order(self) -> MultiAxisJudgmentRecord:
+        ordered = self.candidate_tool_order
+        scored = [score.tool_id for score in self.scores]
+        if set(ordered) != set(scored):
+            raise ValueError("scores must cover the candidate tool order exactly")
+        if len(scored) != len(set(scored)):
+            raise ValueError("scores must not contain duplicate tool ids")
+        return self
+
+
 class TargetScore(StrictModel):
     tool_id: str
     confidence: float
+
+
+class MultiAxisTargetScore(StrictModel):
+    tool_id: str
+    scores: dict[ScoreAxis, float]
+    raw_scores: dict[ScoreAxis, float] = Field(default_factory=dict)
+    local_z: dict[ScoreAxis, float] = Field(default_factory=dict)
+    judge_disagreement: dict[ScoreAxis, float] = Field(default_factory=dict)
 
 
 class SampleQuality(StrictModel):

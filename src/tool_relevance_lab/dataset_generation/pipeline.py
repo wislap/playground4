@@ -25,9 +25,14 @@ from tool_relevance_lab.dataset_generation.llm import (
     OpenAICompatibleConfig,
     OpenAICompatibleLLMClient,
 )
+from tool_relevance_lab.dataset_generation.multiaxis import (
+    calibrate_multiaxis_confidences,
+    judge_candidate_sets_multiaxis,
+    multiaxis_rows_to_jsonl,
+)
 from tool_relevance_lab.dataset_generation.quality import summarize_quality
 from tool_relevance_lab.dataset_generation.resumable import ResumableRunSummary, write_run_summary
-from tool_relevance_lab.dataset_generation.schemas import CandidateSetRecord, JudgmentRecord
+from tool_relevance_lab.dataset_generation.schemas import CandidateSetRecord, JudgmentRecord, MultiAxisJudgmentRecord
 from tool_relevance_lab.dataset_generation.tool_store import load_tool_universes
 
 
@@ -64,6 +69,7 @@ class PipelineConfig:
     target_force_rate: float = 1.0
     weight_decay_on_select: float = 0.70
     judge_run_id: str = "judge_v3"
+    judge_mode: str = "single"
     clip_percentile: float = 0.001
     generator: APIClientConfig = field(default_factory=APIClientConfig)
     judge: APIClientConfig = field(default_factory=APIClientConfig)
@@ -136,6 +142,7 @@ def load_pipeline_config(path: Path) -> PipelineConfig:
         target_force_rate=float(sampling.get("target_force_rate", 1.0)),
         weight_decay_on_select=float(sampling.get("weight_decay_on_select", 0.70)),
         judge_run_id=str(llm.get("judge", {}).get("judge_run_id", "judge_v3")),
+        judge_mode=str(llm.get("judge", {}).get("mode", "single")),
         clip_percentile=float(calibration.get("clip_percentile", 0.001)),
         generator=_api_config(
             llm.get("generator", {}),
@@ -226,29 +233,60 @@ async def run_dataset_pipeline(
     )
     write_run_summary(paths.candidate_summary, candidate_summary)
 
-    print(f"[pipeline] stage 3/5 judge candidates -> {paths.judgments}")
-    judgment_summary = await judge_candidate_sets(
-        universe=universe,
-        client=judge_client,
-        conversations_path=paths.conversations,
-        candidate_sets_path=paths.candidate_sets,
-        output_path=paths.judgments,
-        error_path=paths.judgment_errors,
-        config=JudgeGenerationConfig(
-            model=config.judge.model or "judge-model",
-            temperature=config.judge.temperature,
-            concurrency=config.judge_concurrency,
-            max_attempts=config.max_attempts,
-            judge_run_id=config.judge_run_id,
+    print(f"[pipeline] stage 3/5 judge candidates ({config.judge_mode}) -> {paths.judgments}")
+    judge_config = JudgeGenerationConfig(
+        model=config.judge.model or "judge-model",
+        temperature=config.judge.temperature,
+        concurrency=config.judge_concurrency,
+        max_attempts=config.max_attempts,
+        judge_run_id=config.judge_run_id,
+        prompt_version=(
+            "neko_tool_multiaxis_judge_v1"
+            if config.judge_mode == "multiaxis"
+            else "neko_tool_relevance_judge_v3"
         ),
-        dry_run=dry_run,
     )
+    if config.judge_mode == "single":
+        judgment_summary = await judge_candidate_sets(
+            universe=universe,
+            client=judge_client,
+            conversations_path=paths.conversations,
+            candidate_sets_path=paths.candidate_sets,
+            output_path=paths.judgments,
+            error_path=paths.judgment_errors,
+            config=judge_config,
+            dry_run=dry_run,
+        )
+    elif config.judge_mode == "multiaxis":
+        judgment_summary = await judge_candidate_sets_multiaxis(
+            universe=universe,
+            client=judge_client,
+            conversations_path=paths.conversations,
+            candidate_sets_path=paths.candidate_sets,
+            output_path=paths.judgments,
+            error_path=paths.judgment_errors,
+            config=judge_config,
+            dry_run=dry_run,
+        )
+    else:
+        raise ValueError(f"unknown judge_mode: {config.judge_mode}")
     write_run_summary(paths.judgment_summary, judgment_summary)
 
     print(f"[pipeline] stage 4/5 calibrate -> {paths.calibrated}")
-    judgments = read_model_jsonl(paths.judgments, JudgmentRecord)
-    calibrated = calibrate_confidences(judgments, clip_percentile=config.clip_percentile)
-    write_jsonl(paths.calibrated, [row.__dict__ for row in calibrated])
+    if config.judge_mode == "single":
+        judgments = read_model_jsonl(paths.judgments, JudgmentRecord)
+        calibrated = calibrate_confidences(judgments, clip_percentile=config.clip_percentile)
+        write_jsonl(paths.calibrated, [row.__dict__ for row in calibrated])
+        calibrated_rows = len(calibrated)
+    else:
+        multiaxis_judgments = read_model_jsonl(paths.judgments, MultiAxisJudgmentRecord)
+        calibrated_multiaxis = calibrate_multiaxis_confidences(
+            multiaxis_judgments,
+            clip_percentile=config.clip_percentile,
+        )
+        write_jsonl(paths.calibrated, multiaxis_rows_to_jsonl(calibrated_multiaxis))
+        judgments = _multiaxis_to_final_judgments(multiaxis_judgments)
+        calibrated_rows = len(calibrated_multiaxis)
 
     print(f"[pipeline] stage 5/5 quality report -> {paths.quality_report}")
     candidate_sets = read_model_jsonl(paths.candidate_sets, CandidateSetRecord)
@@ -270,7 +308,7 @@ async def run_dataset_pipeline(
         conversation_summary=conversation_summary,
         candidate_summary=candidate_summary,
         judgment_summary=judgment_summary,
-        calibrated_rows=len(calibrated),
+        calibrated_rows=calibrated_rows,
         quality_report=quality_payload,
     )
     _write_manifest(paths.manifest, config=config, dry_run=dry_run, status="completed", result=result)
@@ -312,6 +350,30 @@ def _build_client(config: APIClientConfig, label: str) -> OpenAICompatibleLLMCli
     )
 
 
+def _multiaxis_to_final_judgments(judgments: list[MultiAxisJudgmentRecord]) -> list[JudgmentRecord]:
+    from tool_relevance_lab.dataset_generation.schemas import RawToolScore
+
+    converted = []
+    for judgment in judgments:
+        converted.append(
+            JudgmentRecord(
+                sample_id=judgment.sample_id,
+                conversation_id=judgment.conversation_id,
+                judge_run_id=judgment.judge_run_id,
+                candidate_tool_order=judgment.candidate_tool_order,
+                scores=[
+                    RawToolScore(
+                        tool_id=tool_score.tool_id,
+                        raw_score=next(score.raw_score for score in tool_score.scores if score.axis == "final_preference"),
+                    )
+                    for tool_score in judgment.scores
+                ],
+                provenance=judgment.provenance,
+            )
+        )
+    return converted
+
+
 def _is_placeholder(value: str) -> bool:
     stripped = (value or "").strip()
     return stripped in {"", "sk-...", "https://your-relay.example/v1"}
@@ -334,6 +396,7 @@ def _safe_config_dump(config: PipelineConfig) -> dict[str, Any]:
         "target_force_rate": config.target_force_rate,
         "weight_decay_on_select": config.weight_decay_on_select,
         "judge_run_id": config.judge_run_id,
+        "judge_mode": config.judge_mode,
         "clip_percentile": config.clip_percentile,
         "generator": _safe_api_dump(config.generator),
         "judge": _safe_api_dump(config.judge),

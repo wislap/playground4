@@ -28,6 +28,11 @@ from tool_relevance_lab.dataset_generation.candidate_generation import (
 from tool_relevance_lab.dataset_generation.jsonl import read_model_jsonl, write_jsonl
 from tool_relevance_lab.dataset_generation.judging import JudgeGenerationConfig, judge_candidate_sets
 from tool_relevance_lab.dataset_generation.llm import OpenAICompatibleConfig, OpenAICompatibleLLMClient
+from tool_relevance_lab.dataset_generation.multiaxis import (
+    calibrate_multiaxis_confidences,
+    judge_candidate_sets_multiaxis,
+    multiaxis_rows_to_jsonl,
+)
 from tool_relevance_lab.dataset_generation.pipeline import (
     load_pipeline_config,
     run_dataset_pipeline,
@@ -36,6 +41,7 @@ from tool_relevance_lab.dataset_generation.quality import summarize_quality
 from tool_relevance_lab.dataset_generation.schemas import (
     CandidateSetRecord,
     JudgmentRecord,
+    MultiAxisJudgmentRecord,
 )
 from tool_relevance_lab.dataset_generation.similarity import find_similar_tools, summarize_similarity
 from tool_relevance_lab.dataset_generation.resumable import run_resumable_jobs, write_run_summary
@@ -63,6 +69,11 @@ def main() -> None:
     calibrate_parser.add_argument("--judgments", "--judgements", dest="judgments", type=Path, required=True)
     calibrate_parser.add_argument("--output", type=Path, required=True)
     calibrate_parser.add_argument("--clip-percentile", type=float, default=0.001)
+
+    calibrate_multiaxis_parser = subparsers.add_parser("calibrate-multiaxis")
+    calibrate_multiaxis_parser.add_argument("--judgments", "--judgements", dest="judgments", type=Path, required=True)
+    calibrate_multiaxis_parser.add_argument("--output", type=Path, required=True)
+    calibrate_multiaxis_parser.add_argument("--clip-percentile", type=float, default=0.001)
 
     report_parser = subparsers.add_parser("report")
     report_parser.add_argument("--tool-universe", type=Path, action="append", required=True)
@@ -185,11 +196,36 @@ def main() -> None:
     judge_parser.add_argument("--retries", type=int, default=3)
     judge_parser.add_argument("--dry-run", action="store_true")
 
+    judge_multiaxis_parser = subparsers.add_parser("judge-candidates-multiaxis")
+    judge_multiaxis_parser.add_argument("--tool-universe", type=Path, action="append", required=True)
+    judge_multiaxis_parser.add_argument("--tool-universe-id")
+    judge_multiaxis_parser.add_argument("--conversations", type=Path, required=True)
+    judge_multiaxis_parser.add_argument("--candidate-sets", type=Path, required=True)
+    judge_multiaxis_parser.add_argument("--output", type=Path, required=True)
+    judge_multiaxis_parser.add_argument("--errors", type=Path, required=True)
+    judge_multiaxis_parser.add_argument("--summary", type=Path)
+    judge_multiaxis_parser.add_argument("--judge-run-id", default="judge_multiaxis_v1")
+    judge_multiaxis_parser.add_argument("--model", default=os.getenv("JUDGE_MODEL", "judge-model"))
+    judge_multiaxis_parser.add_argument("--base-url", default=os.getenv("JUDGE_BASE_URL", ""))
+    judge_multiaxis_parser.add_argument("--api-key", default=os.getenv("JUDGE_API_KEY", ""))
+    judge_multiaxis_parser.add_argument("--temperature", type=float, default=0.2)
+    judge_multiaxis_parser.add_argument("--concurrency", type=int, default=4)
+    judge_multiaxis_parser.add_argument("--max-attempts", type=int, default=3)
+    judge_multiaxis_parser.add_argument("--timeout-seconds", type=float, default=120.0)
+    judge_multiaxis_parser.add_argument("--retries", type=int, default=3)
+    judge_multiaxis_parser.add_argument("--dry-run", action="store_true")
+
     args = parser.parse_args()
     if args.command == "calibrate":
         judgments = read_model_jsonl(args.judgments, JudgmentRecord)
         scores = calibrate_confidences(judgments, clip_percentile=args.clip_percentile)
         write_jsonl(args.output, [score.__dict__ for score in scores])
+        return
+
+    if args.command == "calibrate-multiaxis":
+        judgments = read_model_jsonl(args.judgments, MultiAxisJudgmentRecord)
+        scores = calibrate_multiaxis_confidences(judgments, clip_percentile=args.clip_percentile)
+        write_jsonl(args.output, multiaxis_rows_to_jsonl(scores))
         return
 
     if args.command == "report":
@@ -450,6 +486,45 @@ def main() -> None:
                     concurrency=args.concurrency,
                     max_attempts=args.max_attempts,
                     judge_run_id=args.judge_run_id,
+                ),
+                dry_run=args.dry_run,
+            )
+        )
+        if args.summary:
+            write_run_summary(args.summary, summary)
+        print(json.dumps(summary.to_dict(), ensure_ascii=False, indent=2, sort_keys=True))
+        return
+
+    if args.command == "judge-candidates-multiaxis":
+        universe = load_tool_universes(args.tool_universe, tool_universe_id=args.tool_universe_id)
+        client = None
+        if not args.dry_run:
+            if not args.api_key or not args.base_url:
+                raise SystemExit("JUDGE_API_KEY/JUDGE_BASE_URL or --api-key/--base-url are required")
+            client = OpenAICompatibleLLMClient(
+                OpenAICompatibleConfig(
+                    api_key=args.api_key,
+                    base_url=args.base_url,
+                    model=args.model,
+                    timeout_seconds=args.timeout_seconds,
+                    max_retries=args.retries,
+                )
+            )
+        summary = asyncio.run(
+            judge_candidate_sets_multiaxis(
+                universe=universe,
+                client=client,
+                conversations_path=args.conversations,
+                candidate_sets_path=args.candidate_sets,
+                output_path=args.output,
+                error_path=args.errors,
+                config=JudgeGenerationConfig(
+                    model=args.model,
+                    temperature=args.temperature,
+                    concurrency=args.concurrency,
+                    max_attempts=args.max_attempts,
+                    judge_run_id=args.judge_run_id,
+                    prompt_version="neko_tool_multiaxis_judge_v1",
                 ),
                 dry_run=args.dry_run,
             )
