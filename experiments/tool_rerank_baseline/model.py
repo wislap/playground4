@@ -344,6 +344,7 @@ class EncodedSequencePairs:
     policy_features: np.ndarray | None
     gate_features: np.ndarray | None
     labels: np.ndarray
+    axis_labels: np.ndarray | None
     conversation_ids: list[str]
     tool_ids: list[str]
     raw_scores: np.ndarray
@@ -462,15 +463,13 @@ class LateInteractionRegressor(nn.Module):
             else None
         )
 
-    def forward(
+    def build_features(
         self,
         conv_seq: torch.Tensor,
         conv_mask: torch.Tensor,
         tool_seq: torch.Tensor,
         tool_mask: torch.Tensor,
         lexical_features: torch.Tensor | None = None,
-        policy_features: torch.Tensor | None = None,
-        gate_features: torch.Tensor | None = None,
     ) -> torch.Tensor:
         conv_seq = torch.nn.functional.normalize(conv_seq, p=2, dim=-1)
         tool_seq = torch.nn.functional.normalize(tool_seq, p=2, dim=-1)
@@ -516,6 +515,25 @@ class LateInteractionRegressor(nn.Module):
                 features = torch.cat([semantic_features, gate * lexical_input], dim=1)
             else:
                 features = torch.cat([semantic_features, lexical_input], dim=1)
+        return features
+
+    def forward(
+        self,
+        conv_seq: torch.Tensor,
+        conv_mask: torch.Tensor,
+        tool_seq: torch.Tensor,
+        tool_mask: torch.Tensor,
+        lexical_features: torch.Tensor | None = None,
+        policy_features: torch.Tensor | None = None,
+        gate_features: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        features = self.build_features(
+            conv_seq=conv_seq,
+            conv_mask=conv_mask,
+            tool_seq=tool_seq,
+            tool_mask=tool_mask,
+            lexical_features=lexical_features,
+        )
         score = self.head(features).squeeze(-1)
         if policy_features is not None and self.policy_residual is not None:
             policy_input = self.policy_dropout(policy_features)
@@ -529,6 +547,118 @@ class LateInteractionRegressor(nn.Module):
             gate_input = self.gate_dropout(gate_features)
             score = score + self.conv_bias_scale * torch.tanh(self.conv_bias(gate_input).squeeze(-1))
         return score
+
+
+class FactorizedLateInteractionRegressor(nn.Module):
+    def __init__(
+        self,
+        *,
+        hidden_size: int,
+        factor_count: int,
+        lexical_dim: int = 0,
+        lexical_fusion: str = "concat",
+        lexical_dropout: float = 0.0,
+        policy_dim: int = 0,
+        policy_scale: float = 0.3,
+        policy_dropout: float = 0.0,
+        policy_hidden_dim: int = 32,
+        gate_dim: int = 0,
+        gate_dropout: float = 0.0,
+        gate_hidden_dim: int = 16,
+        conv_bias_scale: float = 0.0,
+        hidden_dim: int = 256,
+        factor_hidden_dim: int = 128,
+        final_feature_dim: int = 32,
+        dropout: float = 0.1,
+        final_head: str = "linear",
+        use_factor_interactions: bool = False,
+        detach_factors_for_final: bool = False,
+    ) -> None:
+        super().__init__()
+        self.factor_count = factor_count
+        self.use_factor_interactions = use_factor_interactions
+        self.detach_factors_for_final = detach_factors_for_final
+        self.base = LateInteractionRegressor(
+            hidden_size=hidden_size,
+            lexical_dim=lexical_dim,
+            lexical_fusion=lexical_fusion,
+            lexical_dropout=lexical_dropout,
+            policy_dim=policy_dim,
+            policy_scale=policy_scale,
+            policy_dropout=policy_dropout,
+            policy_hidden_dim=policy_hidden_dim,
+            gate_dim=gate_dim,
+            gate_dropout=gate_dropout,
+            gate_hidden_dim=gate_hidden_dim,
+            conv_bias_scale=conv_bias_scale,
+            hidden_dim=hidden_dim,
+            dropout=dropout,
+            head="linear",
+        )
+        feature_dim = int(self.base.head.in_features)
+        factor_hidden_dim = max(8, factor_hidden_dim)
+        self.factor_head = nn.Sequential(
+            nn.Linear(feature_dim, factor_hidden_dim),
+            nn.LayerNorm(factor_hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(factor_hidden_dim, factor_count),
+        )
+        self.final_feature_projection = (
+            nn.Sequential(
+                nn.Linear(feature_dim, final_feature_dim),
+                nn.LayerNorm(final_feature_dim),
+                nn.GELU(),
+            )
+            if final_feature_dim > 0
+            else None
+        )
+        interaction_dim = 7 if use_factor_interactions else 0
+        final_input_dim = factor_count + interaction_dim + max(0, final_feature_dim)
+        self.final_head = _build_head(
+            input_dim=final_input_dim,
+            hidden_dim=hidden_dim,
+            dropout=dropout,
+            head=final_head,
+        )
+
+    def forward(
+        self,
+        conv_seq: torch.Tensor,
+        conv_mask: torch.Tensor,
+        tool_seq: torch.Tensor,
+        tool_mask: torch.Tensor,
+        lexical_features: torch.Tensor | None = None,
+        policy_features: torch.Tensor | None = None,
+        gate_features: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        features = self.base.build_features(
+            conv_seq=conv_seq,
+            conv_mask=conv_mask,
+            tool_seq=tool_seq,
+            tool_mask=tool_mask,
+            lexical_features=lexical_features,
+        )
+        factors = self.factor_head(features)
+        final_factors = factors.detach() if self.detach_factors_for_final else factors
+        final_parts = [final_factors]
+        if self.use_factor_interactions:
+            final_parts.append(_factor_interactions(final_factors))
+        if self.final_feature_projection is not None:
+            final_parts.append(self.final_feature_projection(features))
+        final = self.final_head(torch.cat(final_parts, dim=1)).squeeze(-1)
+        if policy_features is not None and self.base.policy_residual is not None:
+            policy_input = self.base.policy_dropout(policy_features)
+            policy_delta = self.base.policy_scale * torch.tanh(self.base.policy_residual(policy_input).squeeze(-1))
+            if gate_features is not None and self.base.policy_gate is not None:
+                gate_input = self.base.gate_dropout(gate_features)
+                policy_multiplier = 2.0 * torch.sigmoid(self.base.policy_gate(gate_input).squeeze(-1))
+                policy_delta = policy_multiplier * policy_delta
+            final = final + policy_delta
+        if gate_features is not None and self.base.conv_bias is not None:
+            gate_input = self.base.gate_dropout(gate_features)
+            final = final + self.base.conv_bias_scale * torch.tanh(self.base.conv_bias(gate_input).squeeze(-1))
+        return {"final": final, "factors": factors}
 
 
 class FieldInteractionRegressor(nn.Module):
@@ -606,6 +736,29 @@ def _build_small_head(*, input_dim: int, hidden_dim: int, dropout: float) -> nn.
         nn.GELU(),
         nn.Dropout(dropout),
         nn.Linear(hidden_dim, 1),
+    )
+
+
+def _factor_interactions(factors: torch.Tensor) -> torch.Tensor:
+    if factors.shape[1] < 6:
+        raise ValueError("factor interactions require six factor predictions")
+    capability = factors[:, 0]
+    action = factors[:, 1]
+    specificity = factors[:, 2]
+    consent = factors[:, 3]
+    cost = factors[:, 4]
+    style = factors[:, 5]
+    return torch.stack(
+        [
+            capability * action,
+            capability * specificity,
+            action * consent,
+            consent * style,
+            action * style,
+            cost * action,
+            cost * consent,
+        ],
+        dim=1,
     )
 
 

@@ -18,9 +18,15 @@ from torch.utils.data import DataLoader
 if str(Path(__file__).parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).parent))
 
-from data import ConversationGroup, PairExample, bundle_from_groups, load_all_groups
+from data import FACTOR_AXIS_NAMES, ConversationGroup, PairExample, bundle_from_groups, load_all_groups
 from metrics import append_jsonl, write_json
-from model import EncodedSequencePairs, LateInteractionRegressor, build_lexical_features, build_sequence_encoder
+from model import (
+    EncodedSequencePairs,
+    FactorizedLateInteractionRegressor,
+    LateInteractionRegressor,
+    build_lexical_features,
+    build_sequence_encoder,
+)
 from policy_features import PolicyFeatureBuilder, build_policy_features
 from training_core import (
     build_tensor_dataset,
@@ -169,7 +175,8 @@ def run_fold(
     )
     policy_residual_cfg = config.get("policy_residual", {})
     conv_gate_cfg = config.get("conv_gate", {})
-    model = LateInteractionRegressor(
+    model_kind = str(config.get("model", {}).get("kind", "sequence_late_interaction"))
+    common_model_kwargs = dict(
         hidden_size=shared_encoding.hidden_size,
         lexical_dim=lexical_dim,
         lexical_fusion=str(config.get("lexical", {}).get("fusion", "concat")),
@@ -184,8 +191,24 @@ def run_fold(
         conv_bias_scale=float(conv_gate_cfg.get("bias_scale", 0.0)),
         hidden_dim=int(config["model"].get("hidden_dim", 256)),
         dropout=float(config["model"].get("dropout", 0.1)),
-        head=str(config["model"].get("head", "mlp")),
-    ).to(device)
+    )
+    if model_kind == "sequence_late_interaction":
+        model = LateInteractionRegressor(
+            **common_model_kwargs,
+            head=str(config["model"].get("head", "mlp")),
+        ).to(device)
+    elif model_kind == "factorized_late_interaction":
+        model = FactorizedLateInteractionRegressor(
+            **common_model_kwargs,
+            factor_count=len(FACTOR_AXIS_NAMES),
+            factor_hidden_dim=int(config["model"].get("factor_hidden_dim", 128)),
+            final_feature_dim=int(config["model"].get("final_feature_dim", 32)),
+            final_head=str(config["model"].get("final_head", "linear")),
+            use_factor_interactions=bool(config["model"].get("use_factor_interactions", False)),
+            detach_factors_for_final=bool(config["model"].get("detach_factors_for_final", False)),
+        ).to(device)
+    else:
+        raise ValueError(f"unknown model.kind: {model_kind}")
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=float(config["train"].get("lr", 1e-3)),
@@ -254,8 +277,8 @@ def build_shared_cv_encoding(
     groups: list[ConversationGroup],
 ) -> SharedCvEncoding:
     model_kind = config.get("model", {}).get("kind", "sequence_late_interaction")
-    if model_kind != "sequence_late_interaction":
-        raise ValueError(f"cross_validate.py currently supports sequence_late_interaction, got {model_kind}")
+    if model_kind not in {"sequence_late_interaction", "factorized_late_interaction"}:
+        raise ValueError(f"cross_validate.py does not support model.kind={model_kind}")
 
     bundle = bundle_from_groups(train_groups=groups, val_groups=[])
     examples = bundle.train_examples
@@ -331,6 +354,7 @@ def subset_shared_pairs(
         policy_features=policy_features,
         gate_features=gate_features,
         labels=pairs.labels[indices],
+        axis_labels=pairs.axis_labels[indices] if pairs.axis_labels is not None else None,
         conversation_ids=[pairs.conversation_ids[index] for index in indices],
         tool_ids=[pairs.tool_ids[index] for index in indices],
         raw_scores=pairs.raw_scores[indices],

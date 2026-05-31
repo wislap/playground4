@@ -1,3 +1,0 @@
-{"attempt": 3, "error_message": "judgment candidate_tool_order must exactly match the candidate set order for sample_id=sample_000242", "error_type": "ValueError", "item_id": "sample_000242", "timestamp": 1780197714.629405}
-{"attempt": 3, "error_message": "judgment candidate_tool_order must exactly match the candidate set order for sample_id=sample_000324", "error_type": "ValueError", "item_id": "sample_000324", "timestamp": 1780197811.2261488}
-{"attempt": 3, "error_message": "judgment candidate_tool_order must exactly match the candidate set order for sample_id=sample_000339", "error_type": "ValueError", "item_id": "sample_000339", "timestamp": 1780197829.090012}

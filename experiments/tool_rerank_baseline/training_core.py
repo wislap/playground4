@@ -20,6 +20,7 @@ from model import (
     EncodedPairs,
     EncodedSequencePairs,
     FieldInteractionRegressor,
+    FactorizedLateInteractionRegressor,
     LexicalFeatureBuilder,
     LateInteractionRegressor,
     PairMLPRegressor,
@@ -98,6 +99,7 @@ def encode_sequence_examples(
         policy_features=policy_features if not policy_as_lexical else None,
         gate_features=gate_features,
         labels=np.asarray([example.label for example in examples], dtype="float32"),
+        axis_labels=_axis_labels_array(examples),
         conversation_ids=[example.conversation_id for example in examples],
         tool_ids=[example.tool_id for example in examples],
         raw_scores=np.asarray([example.raw_score for example in examples], dtype="float32"),
@@ -205,6 +207,7 @@ def build_tensor_dataset(pairs: EncodedPairs | EncodedSequencePairs | EncodedFie
                 torch.from_numpy(_feature_or_empty(pairs.policy_features, count)),
                 torch.from_numpy(_feature_or_empty(pairs.gate_features, count)),
                 torch.from_numpy(pairs.labels),
+                torch.from_numpy(_axis_labels_or_empty(pairs.axis_labels, count)),
             )
         return TensorDataset(
             torch.from_numpy(pairs.conv_sequences),
@@ -212,6 +215,7 @@ def build_tensor_dataset(pairs: EncodedPairs | EncodedSequencePairs | EncodedFie
             torch.from_numpy(pairs.tool_sequences),
             torch.from_numpy(pairs.tool_masks),
             torch.from_numpy(pairs.labels),
+            torch.from_numpy(_axis_labels_or_empty(pairs.axis_labels, len(pairs.labels))),
         )
     return TensorDataset(
         torch.from_numpy(pairs.features),
@@ -221,7 +225,7 @@ def build_tensor_dataset(pairs: EncodedPairs | EncodedSequencePairs | EncodedFie
 
 def train_one_epoch(
     *,
-    model: PairMLPRegressor | LateInteractionRegressor | FieldInteractionRegressor,
+    model: PairMLPRegressor | LateInteractionRegressor | FieldInteractionRegressor | FactorizedLateInteractionRegressor,
     optimizer: torch.optim.Optimizer,
     loader: DataLoader,
     full_train: EncodedPairs | EncodedSequencePairs | EncodedFieldSequencePairs,
@@ -237,9 +241,18 @@ def train_one_epoch(
     pointwise_weight = float(loss_cfg.get("pointwise_weight", 1.0))
     optimizer.zero_grad()
     for step, batch in enumerate(loader, start=1):
-        predictions, labels = predict_batch(model, batch, device)
+        outputs, labels, axis_labels = model_batch_outputs(model, batch, device)
+        predictions = _final_prediction(outputs)
         pointwise_loss = criterion(predictions, labels)
         loss = pointwise_weight * pointwise_loss
+        if isinstance(model, FactorizedLateInteractionRegressor):
+            if axis_labels is None or axis_labels.shape[1] == 0:
+                raise ValueError("factorized model requires axis_labels in the dataset")
+            factor_loss = criterion(outputs["factors"], axis_labels)
+            factor_weighted_loss = float(loss_cfg.get("factor_weight", 0.3)) * factor_loss
+            loss = loss + factor_weighted_loss
+            _accumulate_loss(component_sums, component_counts, "factor_loss", factor_loss)
+            _accumulate_loss(component_sums, component_counts, "factor_weighted_loss", factor_weighted_loss)
         (loss / grad_accum_steps).backward()
         if step % grad_accum_steps == 0:
             optimizer.step()
@@ -372,7 +385,7 @@ def train_one_epoch(
 
 def evaluate_saved_checkpoints(
     *,
-    model: PairMLPRegressor | LateInteractionRegressor | FieldInteractionRegressor,
+    model: PairMLPRegressor | LateInteractionRegressor | FieldInteractionRegressor | FactorizedLateInteractionRegressor,
     checkpoint_dir: Path,
     train_pairs: EncodedPairs | EncodedSequencePairs | EncodedFieldSequencePairs,
     val_pairs: EncodedPairs | EncodedSequencePairs | EncodedFieldSequencePairs,
@@ -480,7 +493,7 @@ def update_best_states(
 
 def materialize_best_checkpoints(
     *,
-    model: PairMLPRegressor | LateInteractionRegressor | FieldInteractionRegressor,
+    model: PairMLPRegressor | LateInteractionRegressor | FieldInteractionRegressor | FactorizedLateInteractionRegressor,
     states: dict[str, dict[str, Any]],
     checkpoint_paths: dict[str, Path],
     pairs: EncodedPairs | EncodedSequencePairs | EncodedFieldSequencePairs,
@@ -505,7 +518,7 @@ def update_best_checkpoints(
     *,
     states: dict[str, dict[str, Any]],
     row: dict[str, Any],
-    model: PairMLPRegressor | LateInteractionRegressor | FieldInteractionRegressor,
+    model: PairMLPRegressor | LateInteractionRegressor | FieldInteractionRegressor | FactorizedLateInteractionRegressor,
     pairs: EncodedPairs | EncodedSequencePairs | EncodedFieldSequencePairs,
     run_dir: Path,
     device: torch.device,
@@ -594,13 +607,22 @@ def _epoch_from_checkpoint_path(path: Path) -> int:
 
 
 def predict_batch(
-    model: PairMLPRegressor | LateInteractionRegressor | FieldInteractionRegressor,
+    model: PairMLPRegressor | LateInteractionRegressor | FieldInteractionRegressor | FactorizedLateInteractionRegressor,
     batch: tuple[torch.Tensor, ...],
     device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    outputs, labels, axis_labels = model_batch_outputs(model, batch, device)
+    return _final_prediction(outputs), labels, axis_labels
+
+
+def model_batch_outputs(
+    model: PairMLPRegressor | LateInteractionRegressor | FieldInteractionRegressor | FactorizedLateInteractionRegressor,
+    batch: tuple[torch.Tensor, ...],
+    device: torch.device,
+) -> tuple[torch.Tensor | dict[str, torch.Tensor], torch.Tensor, torch.Tensor | None]:
     if len(batch) == 2:
         features, labels = batch
-        return model(features.to(device)), labels.to(device)
+        return model(features.to(device)), labels.to(device), None
     if isinstance(model, FieldInteractionRegressor):
         conv_seq = batch[0]
         conv_mask = batch[1]
@@ -625,6 +647,32 @@ def predict_batch(
                 lexical_features,
             ),
             labels.to(device),
+            None,
+        )
+    if len(batch) == 9:
+        (
+            conv_seq,
+            conv_mask,
+            tool_seq,
+            tool_mask,
+            lexical_features,
+            policy_features,
+            gate_features,
+            labels,
+            axis_labels,
+        ) = batch
+        return (
+            model(
+                conv_seq.to(device),
+                conv_mask.to(device),
+                tool_seq.to(device),
+                tool_mask.to(device),
+                _none_if_empty(lexical_features.to(device)),
+                _none_if_empty(policy_features.to(device)),
+                _none_if_empty(gate_features.to(device)),
+            ),
+            labels.to(device),
+            _none_if_empty(axis_labels.to(device)),
         )
     if len(batch) == 8:
         conv_seq, conv_mask, tool_seq, tool_mask, lexical_features, policy_features, gate_features, labels = batch
@@ -639,18 +687,19 @@ def predict_batch(
                 _none_if_empty(gate_features.to(device)),
             ),
             labels.to(device),
+            None,
         )
     if len(batch) == 6:
-        conv_seq, conv_mask, tool_seq, tool_mask, lexical_features, labels = batch
+        conv_seq, conv_mask, tool_seq, tool_mask, labels, axis_labels = batch
         return (
             model(
                 conv_seq.to(device),
                 conv_mask.to(device),
                 tool_seq.to(device),
                 tool_mask.to(device),
-                lexical_features.to(device),
             ),
             labels.to(device),
+            _none_if_empty(axis_labels.to(device)),
         )
     conv_seq, conv_mask, tool_seq, tool_mask, labels = batch
     return (
@@ -661,11 +710,12 @@ def predict_batch(
             tool_mask.to(device),
         ),
         labels.to(device),
+        None,
     )
 
 
 def predict_all(
-    model: PairMLPRegressor | LateInteractionRegressor | FieldInteractionRegressor,
+    model: PairMLPRegressor | LateInteractionRegressor | FieldInteractionRegressor | FactorizedLateInteractionRegressor,
     pairs: EncodedPairs | EncodedSequencePairs | EncodedFieldSequencePairs,
     device: torch.device,
 ) -> torch.Tensor:
@@ -680,7 +730,7 @@ def predict_all(
                 else None
             )
             outputs.append(
-                model(
+                _final_prediction(model(
                     torch.from_numpy(pairs.conv_sequences[start:end]).to(device),
                     torch.from_numpy(pairs.conv_masks[start:end]).to(device),
                     {
@@ -692,7 +742,7 @@ def predict_all(
                         for field_name in pairs.field_names
                     },
                     lexical_features,
-                )
+                ))
             )
         return torch.cat(outputs, dim=0)
     if isinstance(pairs, EncodedSequencePairs):
@@ -716,7 +766,7 @@ def predict_all(
                 else None
             )
             outputs.append(
-                model(
+                _final_prediction(model(
                     torch.from_numpy(pairs.conv_sequences[start:end]).to(device),
                     torch.from_numpy(pairs.conv_masks[start:end]).to(device),
                     torch.from_numpy(pairs.tool_sequences[start:end]).to(device),
@@ -724,10 +774,10 @@ def predict_all(
                     lexical_features,
                     policy_features,
                     gate_features,
-                )
+                ))
             )
         return torch.cat(outputs, dim=0)
-    return model(torch.from_numpy(pairs.features).to(device))
+    return _final_prediction(model(torch.from_numpy(pairs.features).to(device)))
 
 
 def pairwise_margin_loss(
@@ -895,10 +945,36 @@ def _feature_or_empty(features: np.ndarray | None, count: int) -> np.ndarray:
     return features.astype("float32", copy=False)
 
 
+def _axis_labels_array(examples: list[PairExample]) -> np.ndarray | None:
+    axis_labels = [example.axis_labels for example in examples]
+    if all(label is None for label in axis_labels):
+        return None
+    if any(label is None for label in axis_labels):
+        missing = [
+            f"{example.sample_id}/{example.tool_id}"
+            for example, label in zip(examples, axis_labels, strict=True)
+            if label is None
+        ][:5]
+        raise ValueError(f"axis labels are partially missing, examples={missing}")
+    return np.asarray(axis_labels, dtype="float32")
+
+
+def _axis_labels_or_empty(axis_labels: np.ndarray | None, count: int) -> np.ndarray:
+    if axis_labels is None:
+        return np.zeros((count, 0), dtype="float32")
+    return axis_labels.astype("float32", copy=False)
+
+
 def _none_if_empty(features: torch.Tensor) -> torch.Tensor | None:
     if features.shape[1] == 0:
         return None
     return features
+
+
+def _final_prediction(outputs: torch.Tensor | dict[str, torch.Tensor]) -> torch.Tensor:
+    if isinstance(outputs, dict):
+        return outputs["final"]
+    return outputs
 
 
 def _prediction_ranks(group_predictions: torch.Tensor) -> torch.Tensor:
@@ -927,7 +1003,7 @@ def _ideal_dcg(gains: torch.Tensor, *, topk: int) -> torch.Tensor:
 
 @torch.no_grad()
 def evaluate(
-    model: PairMLPRegressor | LateInteractionRegressor | FieldInteractionRegressor,
+    model: PairMLPRegressor | LateInteractionRegressor | FieldInteractionRegressor | FactorizedLateInteractionRegressor,
     pairs: EncodedPairs | EncodedSequencePairs | EncodedFieldSequencePairs,
     config: dict[str, Any],
     device: torch.device,
@@ -935,7 +1011,7 @@ def evaluate(
     model.eval()
     predictions = predict_all(model, pairs, device).cpu().numpy()
     eval_cfg = config["eval"]
-    return compute_metrics(
+    metrics = compute_metrics(
         labels=pairs.labels,
         predictions=predictions,
         conversation_ids=pairs.conversation_ids,
@@ -944,33 +1020,111 @@ def evaluate(
         high_pred_threshold=float(eval_cfg.get("high_pred_threshold", 0.8)),
         topk=int(eval_cfg.get("topk", 3)),
     )
+    if isinstance(model, FactorizedLateInteractionRegressor) and isinstance(pairs, EncodedSequencePairs):
+        metrics.update(factor_metrics(model=model, pairs=pairs, device=device))
+    return metrics
 
 
 @torch.no_grad()
 def write_predictions(
     path: Path,
-    model: PairMLPRegressor | LateInteractionRegressor | FieldInteractionRegressor,
+    model: PairMLPRegressor | LateInteractionRegressor | FieldInteractionRegressor | FactorizedLateInteractionRegressor,
     pairs: EncodedPairs | EncodedSequencePairs | EncodedFieldSequencePairs,
     device: torch.device,
 ) -> None:
     model.eval()
     predictions = predict_all(model, pairs, device).cpu().numpy()
+    factor_predictions = None
+    if isinstance(model, FactorizedLateInteractionRegressor) and isinstance(pairs, EncodedSequencePairs):
+        factor_predictions = predict_factors(model, pairs, device).cpu().numpy()
     with path.open("w", encoding="utf-8") as handle:
         for index, pred in enumerate(predictions):
+            row = {
+                "conversation_id": pairs.conversation_ids[index],
+                "tool_id": pairs.tool_ids[index],
+                "label": float(pairs.labels[index]),
+                "prediction": float(pred),
+                "raw_score": float(pairs.raw_scores[index]),
+            }
+            if factor_predictions is not None:
+                row["factor_predictions"] = [float(value) for value in factor_predictions[index]]
+                if isinstance(pairs, EncodedSequencePairs) and pairs.axis_labels is not None:
+                    row["factor_labels"] = [float(value) for value in pairs.axis_labels[index]]
             handle.write(
                 json.dumps(
-                    {
-                        "conversation_id": pairs.conversation_ids[index],
-                        "tool_id": pairs.tool_ids[index],
-                        "label": float(pairs.labels[index]),
-                        "prediction": float(pred),
-                        "raw_score": float(pairs.raw_scores[index]),
-                    },
+                    row,
                     ensure_ascii=False,
                     sort_keys=True,
                 )
             )
             handle.write("\n")
+
+
+@torch.no_grad()
+def predict_factors(
+    model: FactorizedLateInteractionRegressor,
+    pairs: EncodedSequencePairs,
+    device: torch.device,
+) -> torch.Tensor:
+    outputs = []
+    batch_size = 256
+    for start in range(0, len(pairs.labels), batch_size):
+        end = min(start + batch_size, len(pairs.labels))
+        lexical_features = (
+            torch.from_numpy(pairs.lexical_features[start:end]).to(device)
+            if pairs.lexical_features is not None
+            else None
+        )
+        policy_features = (
+            torch.from_numpy(pairs.policy_features[start:end]).to(device)
+            if pairs.policy_features is not None
+            else None
+        )
+        gate_features = (
+            torch.from_numpy(pairs.gate_features[start:end]).to(device)
+            if pairs.gate_features is not None
+            else None
+        )
+        batch_outputs = model(
+            torch.from_numpy(pairs.conv_sequences[start:end]).to(device),
+            torch.from_numpy(pairs.conv_masks[start:end]).to(device),
+            torch.from_numpy(pairs.tool_sequences[start:end]).to(device),
+            torch.from_numpy(pairs.tool_masks[start:end]).to(device),
+            lexical_features,
+            policy_features,
+            gate_features,
+        )
+        outputs.append(batch_outputs["factors"])
+    return torch.cat(outputs, dim=0)
+
+
+def factor_metrics(
+    *,
+    model: FactorizedLateInteractionRegressor,
+    pairs: EncodedSequencePairs,
+    device: torch.device,
+) -> dict[str, float]:
+    if pairs.axis_labels is None:
+        return {}
+    predictions = predict_factors(model, pairs, device).cpu().numpy()
+    labels = pairs.axis_labels
+    error = predictions - labels
+    metrics: dict[str, float] = {
+        "factor_mae": float(np.mean(np.abs(error))),
+        "factor_mse": float(np.mean(error * error)),
+    }
+    axis_names = [
+        "capability_match",
+        "action_demand",
+        "target_specificity",
+        "consent_boundary",
+        "intervention_cost",
+        "companionship_fit",
+    ]
+    for index, axis_name in enumerate(axis_names):
+        axis_error = error[:, index]
+        metrics[f"factor_{axis_name}_mae"] = float(np.mean(np.abs(axis_error)))
+    return metrics
 
 
 def set_seed(seed: int) -> None:

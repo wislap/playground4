@@ -14,6 +14,16 @@ if str(REPO_ROOT / "src") not in sys.path:
 from tool_relevance_lab.dataset_generation.tool_store import load_tool_universes  # noqa: E402
 
 
+FACTOR_AXIS_NAMES: tuple[str, ...] = (
+    "capability_match",
+    "action_demand",
+    "target_specificity",
+    "consent_boundary",
+    "intervention_cost",
+    "companionship_fit",
+)
+
+
 @dataclass(frozen=True)
 class PairExample:
     sample_id: str
@@ -26,6 +36,7 @@ class PairExample:
     tool_fields: dict[str, str]
     scenario_type: str
     relevance_mode: str
+    axis_labels: tuple[float, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -69,6 +80,7 @@ def load_all_groups(config: dict[str, Any]) -> list[ConversationGroup]:
     }
 
     label_field = data_cfg.get("label_field", "confidence")
+    require_axis_scores = bool(data_cfg.get("require_axis_scores", False))
     grouped: dict[str, list[PairExample]] = {}
     for row in _read_jsonl(run_dir / "calibrated.jsonl"):
         sample_id = row["sample_id"]
@@ -78,6 +90,11 @@ def load_all_groups(config: dict[str, Any]) -> list[ConversationGroup]:
         conversation = conversations[conversation_id]
         tool = tools[tool_id]
         extra = conversation.get("provenance", {}).get("extra", {})
+        axis_labels = _axis_labels_from_row(row)
+        if require_axis_scores and axis_labels is None:
+            raise ValueError(
+                f"axis_scores are required but missing for sample_id={sample_id} tool_id={tool_id}"
+            )
         example = PairExample(
             sample_id=sample_id,
             conversation_id=conversation_id,
@@ -89,6 +106,7 @@ def load_all_groups(config: dict[str, Any]) -> list[ConversationGroup]:
             tool_fields=render_tool_fields(tool.model_dump(mode="json")),
             scenario_type=str(extra.get("scenario_type", "unknown")),
             relevance_mode=str(extra.get("tool_relevance_mode", "unknown")),
+            axis_labels=axis_labels,
         )
         grouped.setdefault(conversation_id, []).append(example)
 
@@ -213,3 +231,15 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
                 except json.JSONDecodeError as exc:
                     raise ValueError(f"invalid JSONL at {path}:{line_number}") from exc
     return rows
+
+
+def _axis_labels_from_row(row: dict[str, Any]) -> tuple[float, ...] | None:
+    axis_scores = row.get("axis_scores")
+    if not isinstance(axis_scores, dict):
+        return None
+    missing = [axis for axis in FACTOR_AXIS_NAMES if axis not in axis_scores]
+    if missing:
+        raise ValueError(
+            f"axis_scores missing required factor axes for sample_id={row.get('sample_id')}: {missing}"
+        )
+    return tuple(float(axis_scores[axis]) for axis in FACTOR_AXIS_NAMES)
