@@ -1,80 +1,152 @@
-# V3 Metadata-Light Policy Features
+# V3.1 Metadata-Light Policy Residual Design
 
-V3 targets P0 personalized plugin recommendation/control for N.E.K.O. It keeps
-the frozen Jina sequence path unchanged and adds a small continuous side-channel
-for permission, boundary, and plugin-control policy.
+Date: 2026-05-30
+
+V3.1 targets P0 personalized plugin recommendation/control for N.E.K.O while
+preserving the V2.2b ranking backbone. The design is based on the V2.2b policy
+feature ablation: policy signals are useful, but directly concatenating all of
+them into the main ranking side-channel hurts precise top-k ranking.
 
 ## Constraints
 
+- Keep grouped 5-fold CV as the only training validation mode.
+- Keep the frozen Jina sequence path unchanged.
 - Do not require richer plugin metadata.
 - Do not add extra Jina computation.
 - Do not introduce discrete action labels.
-- Keep train/inference close to linear cost.
-- Support 5-fold CV only.
+- Keep train and inference close to linear cost.
+- Preserve continuous confidence prediction.
 
 ## Inputs
 
 The feature extractor uses only data already available in the current dataset:
 
 - `conversation_text`
-- conversation provenance rendered into text
 - `scenario_type`
 - `tool_relevance_mode`
 - `tool_id`
 - rendered `tool_text`
-- `raw_score`
+
+`raw_score` is intentionally excluded from policy features because it is a
+teacher-side signal and would leak label construction information.
 
 ## Feature Groups
 
-`policy_features.py` emits 63 continuous features:
-
-- conversation policy features:
-  `agentic_task`, `companion`, `boundary`, `actionable`, `authorized`,
-  explicit refusal/no-tool/no-reminder/no-upload/no-monitoring/no-search/no-file
-  /no-planning/no-control signals.
-- tool text inferred features:
-  agent/plugin, file, browser, search, message, calendar, reminder, monitoring,
-  emotion, audio, camera, home, travel, code, research, study, social, external,
-  proactive.
-- interaction conflict/opportunity features:
-  refusal-domain conflict, no-monitoring x monitoring tool, no-planning x travel,
-  companion x proactive, agentic control opportunity.
-- cross features:
-  raw score and raw/policy interactions for linear-friendly modeling.
-
-All features are soft continuous signals in `[-1, 1]`; none are hard blocks.
-
-## Model Integration
-
-For the first implementation, policy features are concatenated onto the existing
-lexical side-channel:
+`policy_features.py` currently exposes four metadata-light feature groups:
 
 ```text
-side_channel = lexical_features + policy_features
+conv          18 features
+tool          20 features
+interaction   11 features
+cross          8 features
 ```
 
-The first V3 config uses:
+The ablation result suggests the following roles:
 
 ```text
-LateInteractionRegressor
-lexical_fusion = gated_add
-head = linear
-loss = SmoothL1 + LambdaNDCG@5
+interaction  main policy residual
+conv         weak gate / weak bias
+tool         not used directly in main ranker
+cross        optional later experiment
 ```
 
-This makes the added model cost tiny: one extra linear projection/gate over a
-small side-channel. The Jina sequence cache is reused as-is.
+## Architecture
 
-## Why This Fits P0
+V3.1 keeps the V2.2b semantic and lexical backbone:
 
-Current V2 mostly asks whether a plugin is semantically related to a
-conversation. V3 adds soft signals for whether recommending or controlling a
-plugin fits the user moment:
+```text
+semantic_features = Jina sequence late interaction(conversation, tool)
+lexical_delta     = gated BM25/ngram projection
+base_score        = MLP(semantic_features + lexical_delta)
+```
 
-- user explicitly asked for action vs. wants companionship
-- user refused a domain or capability
-- plugin text implies monitoring, messaging, browser, file, or external action
-- semantic relevance conflicts with a boundary
+Policy is added as a bounded residual, not as an unconstrained concatenated
+ranking feature:
 
-This directly targets observed bad cases where a tool is topically relevant but
-should not be recommended or controlled.
+```text
+policy_delta = policy_scale * tanh(policy_head(interaction_features))
+```
+
+When conversation gate features are enabled:
+
+```text
+policy_multiplier = 2 * sigmoid(conv_gate(conv_features))
+conv_bias         = conv_bias_scale * tanh(conv_bias_head(conv_features))
+
+final_score = base_score + policy_multiplier * policy_delta + conv_bias
+```
+
+The default residual scale is intentionally small:
+
+```text
+policy_scale = 0.3
+conv_bias_scale = 0.05
+```
+
+This makes policy a correction to the semantic/lexical ranker rather than a
+replacement for it.
+
+## Why Not Full Policy Concat
+
+The V2.2b ablation showed:
+
+```text
+policy_all:  top1 .800 -> .750, top3 .900 -> .850
+tool-only:   top3 .900 -> .830, regret5 .033 -> .069
+interaction: top1 .800 -> .830, regret5 preserved
+```
+
+Full policy concat improves broad calibration metrics, but it hurts precise
+candidate-set ranking. Tool-only features behave like an overconfident static
+prior: they can make the model more confident without making it better at
+selecting the right tool for the current user turn.
+
+For N.E.K.O this is risky because the system is not a pure tool router. A user
+mentioning a domain does not necessarily authorize action, monitoring, upload,
+messaging, browsing, or agent control.
+
+## Active V3.1 Variants
+
+The first V3.1 CV configs are:
+
+```text
+config_jina_sequence_policy_v31_interaction_residual_cv_lambda_gpu.toml
+config_jina_sequence_policy_v31_interaction_conv_gate_cv_lambda_gpu.toml
+config_jina_sequence_policy_v31_interaction_conv_gate_dropout_cv_lambda_gpu.toml
+```
+
+They test:
+
+```text
+A. interaction-only bounded residual
+B. interaction residual + weak conv gate/bias
+C. interaction residual + weak conv gate/bias + stronger feature dropout
+```
+
+All three keep the V2.2b LambdaNDCG setup fixed.
+
+## Success Criteria
+
+Compared with `jina_sequence_lexical_gated_v22b_cv_lambda_gpu`, a useful V3.1
+variant should aim for:
+
+```text
+top1_match       >= 0.83
+topk_recall      >= 0.89
+top5_regret      <= 0.033
+bad_top3_rate    close to baseline
+bad_top5_rate    close to baseline
+no_tool_fp_rate  no regression
+```
+
+Slice metrics should be added before treating the result as stable:
+
+```text
+companion / emotional support / no-tool
+boundary or refusal
+agentic task
+explicit plugin action
+external side-effect tools
+monitoring or proactive tools
+file/browser/search tools
+```

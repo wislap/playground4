@@ -48,6 +48,8 @@ def encode_sequence_examples(
     split_name: str,
     lexical_builder: LexicalFeatureBuilder | None = None,
     policy_builder: PolicyFeatureBuilder | None = None,
+    gate_builder: PolicyFeatureBuilder | None = None,
+    policy_as_lexical: bool = True,
 ) -> EncodedSequencePairs:
     batch_size = int(config["encoder"].get("batch_size", 8))
     unique_conversations = sorted({example.conversation_id: example.conversation_text for example in examples}.items())
@@ -74,11 +76,17 @@ def encode_sequence_examples(
         )
     if policy_builder is not None:
         policy_features = policy_builder.transform(examples)
-        lexical_features = (
-            policy_features
-            if lexical_features is None
-            else np.concatenate([lexical_features, policy_features], axis=1).astype("float32")
-        )
+        if policy_as_lexical:
+            lexical_features = (
+                policy_features
+                if lexical_features is None
+                else np.concatenate([lexical_features, policy_features], axis=1).astype("float32")
+            )
+        else:
+            policy_features = policy_features.astype("float32")
+    else:
+        policy_features = None
+    gate_features = gate_builder.transform(examples).astype("float32") if gate_builder is not None else None
     conv_indices = np.asarray([conv_index[example.conversation_id] for example in examples], dtype=np.int64)
     tool_indices = np.asarray([tool_index[example.tool_id] for example in examples], dtype=np.int64)
     return EncodedSequencePairs(
@@ -87,6 +95,8 @@ def encode_sequence_examples(
         tool_sequences=np.asarray(tool_seq[tool_indices], dtype="float32"),
         tool_masks=np.asarray(tool_mask[tool_indices], dtype="bool"),
         lexical_features=lexical_features,
+        policy_features=policy_features if not policy_as_lexical else None,
+        gate_features=gate_features,
         labels=np.asarray([example.label for example in examples], dtype="float32"),
         conversation_ids=[example.conversation_id for example in examples],
         tool_ids=[example.tool_id for example in examples],
@@ -180,13 +190,20 @@ def build_tensor_dataset(pairs: EncodedPairs | EncodedSequencePairs | EncodedFie
         tensors.append(torch.from_numpy(pairs.labels))
         return TensorDataset(*tensors)
     if isinstance(pairs, EncodedSequencePairs):
-        if pairs.lexical_features is not None:
+        if (
+            pairs.lexical_features is not None
+            or pairs.policy_features is not None
+            or pairs.gate_features is not None
+        ):
+            count = len(pairs.labels)
             return TensorDataset(
                 torch.from_numpy(pairs.conv_sequences),
                 torch.from_numpy(pairs.conv_masks),
                 torch.from_numpy(pairs.tool_sequences),
                 torch.from_numpy(pairs.tool_masks),
-                torch.from_numpy(pairs.lexical_features),
+                torch.from_numpy(_feature_or_empty(pairs.lexical_features, count)),
+                torch.from_numpy(_feature_or_empty(pairs.policy_features, count)),
+                torch.from_numpy(_feature_or_empty(pairs.gate_features, count)),
                 torch.from_numpy(pairs.labels),
             )
         return TensorDataset(
@@ -584,18 +601,6 @@ def predict_batch(
     if len(batch) == 2:
         features, labels = batch
         return model(features.to(device)), labels.to(device)
-    if len(batch) == 6:
-        conv_seq, conv_mask, tool_seq, tool_mask, lexical_features, labels = batch
-        return (
-            model(
-                conv_seq.to(device),
-                conv_mask.to(device),
-                tool_seq.to(device),
-                tool_mask.to(device),
-                lexical_features.to(device),
-            ),
-            labels.to(device),
-        )
     if isinstance(model, FieldInteractionRegressor):
         conv_seq = batch[0]
         conv_mask = batch[1]
@@ -618,6 +623,32 @@ def predict_batch(
                 field_sequences,
                 field_masks,
                 lexical_features,
+            ),
+            labels.to(device),
+        )
+    if len(batch) == 8:
+        conv_seq, conv_mask, tool_seq, tool_mask, lexical_features, policy_features, gate_features, labels = batch
+        return (
+            model(
+                conv_seq.to(device),
+                conv_mask.to(device),
+                tool_seq.to(device),
+                tool_mask.to(device),
+                _none_if_empty(lexical_features.to(device)),
+                _none_if_empty(policy_features.to(device)),
+                _none_if_empty(gate_features.to(device)),
+            ),
+            labels.to(device),
+        )
+    if len(batch) == 6:
+        conv_seq, conv_mask, tool_seq, tool_mask, lexical_features, labels = batch
+        return (
+            model(
+                conv_seq.to(device),
+                conv_mask.to(device),
+                tool_seq.to(device),
+                tool_mask.to(device),
+                lexical_features.to(device),
             ),
             labels.to(device),
         )
@@ -674,6 +705,16 @@ def predict_all(
                 if pairs.lexical_features is not None
                 else None
             )
+            policy_features = (
+                torch.from_numpy(pairs.policy_features[start:end]).to(device)
+                if pairs.policy_features is not None
+                else None
+            )
+            gate_features = (
+                torch.from_numpy(pairs.gate_features[start:end]).to(device)
+                if pairs.gate_features is not None
+                else None
+            )
             outputs.append(
                 model(
                     torch.from_numpy(pairs.conv_sequences[start:end]).to(device),
@@ -681,6 +722,8 @@ def predict_all(
                     torch.from_numpy(pairs.tool_sequences[start:end]).to(device),
                     torch.from_numpy(pairs.tool_masks[start:end]).to(device),
                     lexical_features,
+                    policy_features,
+                    gate_features,
                 )
             )
         return torch.cat(outputs, dim=0)
@@ -844,6 +887,18 @@ def _group_indices(conversation_ids: list[str]) -> dict[str, list[int]]:
     for index, conversation_id in enumerate(conversation_ids):
         by_group.setdefault(conversation_id, []).append(index)
     return by_group
+
+
+def _feature_or_empty(features: np.ndarray | None, count: int) -> np.ndarray:
+    if features is None:
+        return np.zeros((count, 0), dtype="float32")
+    return features.astype("float32", copy=False)
+
+
+def _none_if_empty(features: torch.Tensor) -> torch.Tensor | None:
+    if features.shape[1] == 0:
+        return None
+    return features
 
 
 def _prediction_ranks(group_predictions: torch.Tensor) -> torch.Tensor:

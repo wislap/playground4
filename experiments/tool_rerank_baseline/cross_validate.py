@@ -126,7 +126,11 @@ def run_fold(
     bundle = bundle_from_groups(train_groups=train_groups, val_groups=val_groups)
     lexical_builder = build_lexical_features(config)
     policy_builder = build_policy_features(config)
+    gate_builder = build_policy_features(config, section="conv_gate")
+    policy_fusion = str(config.get("policy_features", {}).get("fusion", "lexical_concat"))
     lexical_dim = 0
+    policy_dim = 0
+    gate_dim = 0
     if lexical_builder is not None:
         lexical_builder.fit(
             sorted({example.conversation_text for example in bundle.train_examples}),
@@ -135,26 +139,49 @@ def run_fold(
         lexical_dim = lexical_builder.feature_dim
         print(f"[{run_dir.name}] lexical feature_dim={lexical_dim}")
     if policy_builder is not None:
-        lexical_dim += policy_builder.feature_dim
-        print(f"[{run_dir.name}] policy feature_dim={policy_builder.feature_dim}")
+        if policy_fusion == "lexical_concat":
+            lexical_dim += policy_builder.feature_dim
+            print(f"[{run_dir.name}] policy feature_dim={policy_builder.feature_dim} fusion=lexical_concat")
+        elif policy_fusion == "residual":
+            policy_dim = policy_builder.feature_dim
+            print(f"[{run_dir.name}] policy feature_dim={policy_dim} fusion=residual")
+        else:
+            raise ValueError(f"unknown policy_features.fusion: {policy_fusion}")
+    if gate_builder is not None:
+        gate_dim = gate_builder.feature_dim
+        print(f"[{run_dir.name}] conv_gate feature_dim={gate_dim}")
 
     train_pairs = subset_shared_pairs(
         shared_encoding,
         bundle.train_examples,
         lexical_builder=lexical_builder,
         policy_builder=policy_builder,
+        gate_builder=gate_builder,
+        policy_as_lexical=policy_fusion == "lexical_concat",
     )
     val_pairs = subset_shared_pairs(
         shared_encoding,
         bundle.val_examples,
         lexical_builder=lexical_builder,
         policy_builder=policy_builder,
+        gate_builder=gate_builder,
+        policy_as_lexical=policy_fusion == "lexical_concat",
     )
+    policy_residual_cfg = config.get("policy_residual", {})
+    conv_gate_cfg = config.get("conv_gate", {})
     model = LateInteractionRegressor(
         hidden_size=shared_encoding.hidden_size,
         lexical_dim=lexical_dim,
         lexical_fusion=str(config.get("lexical", {}).get("fusion", "concat")),
         lexical_dropout=float(config.get("lexical", {}).get("dropout", 0.0)),
+        policy_dim=policy_dim,
+        policy_scale=float(policy_residual_cfg.get("scale", 0.3)),
+        policy_dropout=float(policy_residual_cfg.get("dropout", 0.0)),
+        policy_hidden_dim=int(policy_residual_cfg.get("hidden_dim", 32)),
+        gate_dim=gate_dim,
+        gate_dropout=float(conv_gate_cfg.get("dropout", 0.0)),
+        gate_hidden_dim=int(conv_gate_cfg.get("hidden_dim", 16)),
+        conv_bias_scale=float(conv_gate_cfg.get("bias_scale", 0.0)),
         hidden_dim=int(config["model"].get("hidden_dim", 256)),
         dropout=float(config["model"].get("dropout", 0.1)),
         head=str(config["model"].get("head", "mlp")),
@@ -267,6 +294,8 @@ def subset_shared_pairs(
     *,
     lexical_builder: Any,
     policy_builder: PolicyFeatureBuilder | None,
+    gate_builder: PolicyFeatureBuilder | None,
+    policy_as_lexical: bool,
 ) -> EncodedSequencePairs:
     indices = np.asarray(
         [shared_encoding.index_by_key[(example.conversation_id, example.tool_id)] for example in examples],
@@ -281,17 +310,26 @@ def subset_shared_pairs(
         )
     if policy_builder is not None:
         policy_features = policy_builder.transform(examples)
-        lexical_features = (
-            policy_features
-            if lexical_features is None
-            else np.concatenate([lexical_features, policy_features], axis=1).astype("float32")
-        )
+        if policy_as_lexical:
+            lexical_features = (
+                policy_features
+                if lexical_features is None
+                else np.concatenate([lexical_features, policy_features], axis=1).astype("float32")
+            )
+            policy_features = None
+        else:
+            policy_features = policy_features.astype("float32")
+    else:
+        policy_features = None
+    gate_features = gate_builder.transform(examples).astype("float32") if gate_builder is not None else None
     return EncodedSequencePairs(
         conv_sequences=pairs.conv_sequences[indices],
         conv_masks=pairs.conv_masks[indices],
         tool_sequences=pairs.tool_sequences[indices],
         tool_masks=pairs.tool_masks[indices],
         lexical_features=lexical_features,
+        policy_features=policy_features,
+        gate_features=gate_features,
         labels=pairs.labels[indices],
         conversation_ids=[pairs.conversation_ids[index] for index in indices],
         tool_ids=[pairs.tool_ids[index] for index in indices],

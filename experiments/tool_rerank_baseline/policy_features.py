@@ -188,8 +188,8 @@ PROACTIVE_PATTERNS = [
 ]
 
 
-def build_policy_features(config: dict) -> PolicyFeatureBuilder | None:
-    cfg = config.get("policy_features", {})
+def build_policy_features(config: dict, *, section: str = "policy_features") -> PolicyFeatureBuilder | None:
+    cfg = config.get(section, {})
     if not cfg.get("enabled", False):
         return None
     groups = tuple(cfg.get("groups", FEATURE_GROUPS.keys()))

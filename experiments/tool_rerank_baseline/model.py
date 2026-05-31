@@ -341,6 +341,8 @@ class EncodedSequencePairs:
     tool_sequences: np.ndarray
     tool_masks: np.ndarray
     lexical_features: np.ndarray | None
+    policy_features: np.ndarray | None
+    gate_features: np.ndarray | None
     labels: np.ndarray
     conversation_ids: list[str]
     tool_ids: list[str]
@@ -390,6 +392,14 @@ class LateInteractionRegressor(nn.Module):
         lexical_dim: int = 0,
         lexical_fusion: str = "concat",
         lexical_dropout: float = 0.0,
+        policy_dim: int = 0,
+        policy_scale: float = 0.3,
+        policy_dropout: float = 0.0,
+        policy_hidden_dim: int = 32,
+        gate_dim: int = 0,
+        gate_dropout: float = 0.0,
+        gate_hidden_dim: int = 16,
+        conv_bias_scale: float = 0.0,
         hidden_dim: int = 256,
         dropout: float = 0.1,
         head: str = "mlp",
@@ -432,6 +442,25 @@ class LateInteractionRegressor(nn.Module):
             dropout=dropout,
             head=head,
         )
+        self.policy_scale = float(policy_scale)
+        self.conv_bias_scale = float(conv_bias_scale)
+        self.policy_dropout = nn.Dropout(policy_dropout)
+        self.gate_dropout = nn.Dropout(gate_dropout)
+        self.policy_residual = (
+            _build_small_head(input_dim=policy_dim, hidden_dim=policy_hidden_dim, dropout=policy_dropout)
+            if policy_dim > 0 and self.policy_scale > 0.0
+            else None
+        )
+        self.policy_gate = (
+            _build_small_head(input_dim=gate_dim, hidden_dim=gate_hidden_dim, dropout=gate_dropout)
+            if gate_dim > 0 and self.policy_residual is not None
+            else None
+        )
+        self.conv_bias = (
+            _build_small_head(input_dim=gate_dim, hidden_dim=gate_hidden_dim, dropout=gate_dropout)
+            if gate_dim > 0 and self.conv_bias_scale > 0.0
+            else None
+        )
 
     def forward(
         self,
@@ -440,6 +469,8 @@ class LateInteractionRegressor(nn.Module):
         tool_seq: torch.Tensor,
         tool_mask: torch.Tensor,
         lexical_features: torch.Tensor | None = None,
+        policy_features: torch.Tensor | None = None,
+        gate_features: torch.Tensor | None = None,
     ) -> torch.Tensor:
         conv_seq = torch.nn.functional.normalize(conv_seq, p=2, dim=-1)
         tool_seq = torch.nn.functional.normalize(tool_seq, p=2, dim=-1)
@@ -485,7 +516,19 @@ class LateInteractionRegressor(nn.Module):
                 features = torch.cat([semantic_features, gate * lexical_input], dim=1)
             else:
                 features = torch.cat([semantic_features, lexical_input], dim=1)
-        return self.head(features).squeeze(-1)
+        score = self.head(features).squeeze(-1)
+        if policy_features is not None and self.policy_residual is not None:
+            policy_input = self.policy_dropout(policy_features)
+            policy_delta = self.policy_scale * torch.tanh(self.policy_residual(policy_input).squeeze(-1))
+            if gate_features is not None and self.policy_gate is not None:
+                gate_input = self.gate_dropout(gate_features)
+                policy_multiplier = 2.0 * torch.sigmoid(self.policy_gate(gate_input).squeeze(-1))
+                policy_delta = policy_multiplier * policy_delta
+            score = score + policy_delta
+        if gate_features is not None and self.conv_bias is not None:
+            gate_input = self.gate_dropout(gate_features)
+            score = score + self.conv_bias_scale * torch.tanh(self.conv_bias(gate_input).squeeze(-1))
+        return score
 
 
 class FieldInteractionRegressor(nn.Module):
@@ -552,6 +595,18 @@ def _build_head(*, input_dim: int, hidden_dim: int, dropout: float, head: str) -
             nn.Linear(hidden_dim // 2, 1),
         )
     raise ValueError(f"unknown model.head: {head}")
+
+
+def _build_small_head(*, input_dim: int, hidden_dim: int, dropout: float) -> nn.Module:
+    hidden_dim = max(1, hidden_dim)
+    if hidden_dim == 1:
+        return nn.Linear(input_dim, 1)
+    return nn.Sequential(
+        nn.Linear(input_dim, hidden_dim),
+        nn.GELU(),
+        nn.Dropout(dropout),
+        nn.Linear(hidden_dim, 1),
+    )
 
 
 def _masked_scalar_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
