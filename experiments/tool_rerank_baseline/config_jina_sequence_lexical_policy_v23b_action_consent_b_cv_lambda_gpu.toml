@@ -1,0 +1,79 @@
+[data]
+run_dir = "data/runs/neko_v3_500"
+tool_universe_paths = [
+  "data/tool_universes/neko_real_v1",
+  "data/tool_universes/synthetic_plugins_v1",
+  "data/tool_universes/synthetic_plugins_v2",
+  "data/tool_universes/synthetic_plugins_v3",
+  "data/tool_universes/synthetic_plugins_v4",
+]
+val_ratio = 0.2
+seed = 20260526
+label_field = "confidence"
+
+[cross_validation]
+cv_ratio = 0.2
+holdout_ratio = 0.2
+folds = 5
+
+[encoder]
+backend = "jina_sequence"
+model_name = "jinaai/jina-embeddings-v5-text-nano-retrieval"
+max_length = 128
+batch_size = 64
+cache_dir = "experiments/tool_rerank_baseline/cache"
+
+[model]
+kind = "sequence_late_interaction"
+head = "mlp"
+hidden_dim = 256
+dropout = 0.1
+
+[lexical]
+enabled = true
+fusion = "gated_add"
+dropout = 0.05
+word_max_features = 20000
+char_max_features = 20000
+bm25_k1 = 1.5
+bm25_b = 0.75
+
+[policy_features]
+enabled = true
+groups = ["action_consent_b"]
+
+[train]
+epochs = 8
+batch_size = 64
+lr = 0.001
+weight_decay = 0.0001
+pairwise_weight = 0.0
+pairwise_margin = 0.1
+device = "cuda"
+
+[loss]
+pointwise_weight = 0.7
+listnet_weight = 0.0
+listnet_temperature = 0.7
+listnet_min_label_gap = 0.05
+lambda_ndcg_weight = 0.3
+lambda_ndcg_topk = 5
+lambda_ndcg_sigma = 1.0
+lambda_ndcg_min_label_gap = 0.05
+bad_exposure_weight = 0.0
+bad_label_threshold = -1.0
+bad_score_margin = 0.0
+no_tool_fp_weight = 0.0
+high_label_threshold = 1.0
+high_score_threshold = 1.0
+score_spread_weight = 0.0
+score_spread_target_std = 0.7
+
+[eval]
+high_label_threshold = 1.0
+high_pred_threshold = 1.0
+topk = 3
+
+[output]
+run_name = "jina_sequence_lexical_policy_v23b_action_consent_b_cv_lambda_gpu"
+run_root = "experiments/tool_rerank_baseline/runs"
