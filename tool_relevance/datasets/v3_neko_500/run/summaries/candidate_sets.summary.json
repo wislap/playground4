@@ -1,0 +1,10 @@
+{
+  "completed_existing": 500,
+  "error_path": "data/runs/neko_v3_500/errors/candidate_sets.errors.jsonl",
+  "failed": 0,
+  "output_path": "data/runs/neko_v3_500/candidate_sets.jsonl",
+  "skipped": 500,
+  "submitted": 0,
+  "succeeded": 0,
+  "total": 500
+}
